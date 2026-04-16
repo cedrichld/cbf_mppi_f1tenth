@@ -1,0 +1,52 @@
+lmppi_node:
+  ros__parameters:
+    # Startup parameters: these are read when the node is constructed.
+    # Changing them online usually requires restarting the node because they
+    # affect subscriptions, map loading, or JAX-compiled array shapes.
+    is_sim: true
+    state_predictor: dynamic_ST
+    n_samples: 1024 # works well at 2048 but not a huge diff
+    n_steps: 6 # 8
+    sim_time_step: 0.1
+    random_seed: 527787
+    render: true
+
+    # Live tuning parameters: mppi_node.get_params() refreshes these on every
+    # odometry callback, so they can be changed with ros2 param set.
+    temperature: 0.6 # 0.12
+    damping: 0.001
+    ref_vel: 5.0
+    init_vel: 2.5
+    startup_speed: 1.0
+    friction: 0.75
+    n_iterations: 1
+
+    # MPPI control exploration.
+    control_sample_std_steer: 0.5
+    control_sample_std_accel: 2.0
+
+    # Physical scale for normalized controls.
+    # normalized steer-rate +1 -> +steer_vel_scale rad/s
+    # normalized acceleration +1 -> +accel_scale m/s^2
+    steer_vel_scale: 3.0
+    accel_scale: 4.0
+
+    # Reward weights. Defaults preserve the original position-only tracker.
+    xy_reward_weight: 1.0
+    velocity_reward_weight: 0.0
+    yaw_reward_weight: 0.0
+
+    # Output safety clamps.
+    min_speed: 0.0
+    max_speed: 20.0
+    max_steering_angle: 0.4189
+
+    # RViz visualization. Add MarkerArray displays for these topics:
+    # /mppi/reference, /mppi/optimal_trajectory, /mppi/sampled_trajectories
+    publish_markers: true
+    marker_frame_id: map
+    reference_line_width: 0.06
+    optimal_line_width: 0.08
+    sampled_line_width: 0.025
+    sampled_trajectory_count: 32
+    sampled_trajectory_alpha: 0.18
