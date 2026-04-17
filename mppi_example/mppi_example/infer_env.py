@@ -181,6 +181,24 @@ class InferEnv():
         
         return reference, ind
     
+    def _profiled_reference_speeds(self, reference):
+        speeds = np.asarray(reference[:, 2], dtype=float)
+        scale = float(getattr(self.config, 'speed_profile_scale', 1.0))
+        min_speed = float(getattr(self.config, 'speed_profile_min_speed', 0.0))
+        max_speed = float(getattr(self.config, 'speed_profile_max_speed', 20.0))
+        max_speed = max(min_speed, max_speed)
+
+        speeds = np.clip(speeds * scale, min_speed, max_speed)
+
+        lookahead_steps = max(0, int(getattr(self.config, 'speed_profile_lookahead_steps', 0)))
+        if lookahead_steps > 0 and speeds.size > 1:
+            padded = np.pad(speeds, (0, lookahead_steps), mode='edge')
+            speeds = np.asarray([
+                np.min(padded[i:i + lookahead_steps + 1])
+                for i in range(speeds.size)
+            ])
+        return speeds
+
     def get_refernece_traj(self, state, target_speed=None, n_steps=10, vind=5, speed_factor=1.0):
         _, dist, _, _, ind = nearest_point(np.array([state[0], state[1]]), 
                                            self.waypoints[:, (1, 2)].copy(), self.diff)
@@ -191,15 +209,29 @@ class InferEnv():
             speed = state[3]
         else:
             speed = target_speed
+
+        if getattr(self.config, 'use_waypoint_speed_profile', False):
+            seed_reference = np.zeros((1, 7))
+            seed_reference[0, 2] = self.waypoints[ind, vind]
+            speed = self._profiled_reference_speeds(seed_reference)[0]
         
-        # if ind < self.waypoints.shape[0] - self.n_steps:
-        #     speeds = self.waypoints[ind:ind+self.n_steps, vind]
-        # else:
         speeds = np.ones(n_steps) * speed
         
         reference = get_reference_trajectory(speeds, dist, ind, 
                                             self.waypoints.copy(), int(n_steps),
                                             self.waypoints_distances.copy(), DT=self.DT)
+        if getattr(self.config, 'use_waypoint_speed_profile', False):
+            # The raceline CSV already carries vx_mps in column 5. Use a light
+            # fixed-point pass so tight-corner speed targets also shorten the
+            # spatial spacing of the future reference, not just its velocity column.
+            for _ in range(max(1, int(getattr(self.config, 'speed_profile_iterations', 1)))):
+                speed_targets = self._profiled_reference_speeds(reference.T)
+                speeds = speed_targets[1:n_steps + 1]
+                reference = get_reference_trajectory(speeds, dist, ind,
+                                                    self.waypoints.copy(), int(n_steps),
+                                                    self.waypoints_distances.copy(), DT=self.DT)
+            reference[2, :] = self._profiled_reference_speeds(reference.T)
+
         orientation = state[4]
         reference[3, :][reference[3, :] - orientation > 5] = np.abs(
             reference[3, :][reference[3, :] - orientation > 5] - (2 * np.pi))

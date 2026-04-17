@@ -82,6 +82,7 @@ class MPPI_Node(Node):
         self.mppi.update(jnp.asarray(state_c_0), jnp.asarray(reference_traj))
         self.get_logger().info('MPPI initialized')
         self.hz = []
+        self.last_speed_command_time = None
         
         
         qos = rclpy.qos.QoSProfile(history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST,
@@ -100,6 +101,7 @@ class MPPI_Node(Node):
         self.reference_marker_pub = self.create_publisher(MarkerArray, "/mppi/reference", qos)
         self.opt_traj_marker_pub = self.create_publisher(MarkerArray, "/mppi/optimal_trajectory", qos)
         self.sampled_traj_marker_pub = self.create_publisher(MarkerArray, "/mppi/sampled_trajectories", qos)
+        self.speed_debug_pub = self.create_publisher(Float32MultiArray, "/mppi/speed_debug", qos)
 
     def default_config_path(self):
         if get_package_share_directory is not None:
@@ -118,6 +120,18 @@ class MPPI_Node(Node):
             'xy_reward_weight': 1.0,
             'velocity_reward_weight': 0.0,
             'yaw_reward_weight': 0.0,
+            'use_waypoint_speed_profile': False,
+            'speed_profile_scale': 1.0,
+            'speed_profile_min_speed': 0.0,
+            'speed_profile_max_speed': 20.0,
+            'speed_profile_lookahead_steps': 0,
+            'speed_profile_iterations': 1,
+            'use_speed_profile_drive_speed': False,
+            'speed_profile_drive_blend': 0.0,
+            'speed_profile_drive_lookahead_steps': 1,
+            'speed_profile_drive_use_min_lookahead': False,
+            'speed_profile_drive_max_accel': 0.0,
+            'speed_profile_drive_max_decel': 0.0,
             'startup_speed': float(self.config.init_vel) * 2.0,
             'min_speed': 0.0,
             'max_speed': 20.0,
@@ -167,6 +181,18 @@ class MPPI_Node(Node):
             'xy_reward_weight': float(self.config.xy_reward_weight),
             'velocity_reward_weight': float(self.config.velocity_reward_weight),
             'yaw_reward_weight': float(self.config.yaw_reward_weight),
+            'use_waypoint_speed_profile': bool(self.config.use_waypoint_speed_profile),
+            'speed_profile_scale': float(self.config.speed_profile_scale),
+            'speed_profile_min_speed': float(self.config.speed_profile_min_speed),
+            'speed_profile_max_speed': float(self.config.speed_profile_max_speed),
+            'speed_profile_lookahead_steps': int(self.config.speed_profile_lookahead_steps),
+            'speed_profile_iterations': int(self.config.speed_profile_iterations),
+            'use_speed_profile_drive_speed': bool(self.config.use_speed_profile_drive_speed),
+            'speed_profile_drive_blend': float(self.config.speed_profile_drive_blend),
+            'speed_profile_drive_lookahead_steps': int(self.config.speed_profile_drive_lookahead_steps),
+            'speed_profile_drive_use_min_lookahead': bool(self.config.speed_profile_drive_use_min_lookahead),
+            'speed_profile_drive_max_accel': float(self.config.speed_profile_drive_max_accel),
+            'speed_profile_drive_max_decel': float(self.config.speed_profile_drive_max_decel),
             'min_speed': float(self.config.min_speed),
             'max_speed': float(self.config.max_speed),
             'max_steering_angle': float(self.config.max_steering_angle),
@@ -217,6 +243,50 @@ class MPPI_Node(Node):
         self.config.xy_reward_weight = float(self.get_parameter('xy_reward_weight').value)
         self.config.velocity_reward_weight = float(self.get_parameter('velocity_reward_weight').value)
         self.config.yaw_reward_weight = float(self.get_parameter('yaw_reward_weight').value)
+        self.config.use_waypoint_speed_profile = bool(self.get_parameter('use_waypoint_speed_profile').value)
+        self.config.speed_profile_scale = max(
+            0.0,
+            float(self.get_parameter('speed_profile_scale').value),
+        )
+        self.config.speed_profile_min_speed = max(
+            0.0,
+            float(self.get_parameter('speed_profile_min_speed').value),
+        )
+        self.config.speed_profile_max_speed = max(
+            self.config.speed_profile_min_speed,
+            float(self.get_parameter('speed_profile_max_speed').value),
+        )
+        self.config.speed_profile_lookahead_steps = max(
+            0,
+            int(self.get_parameter('speed_profile_lookahead_steps').value),
+        )
+        self.config.speed_profile_iterations = max(
+            1,
+            int(self.get_parameter('speed_profile_iterations').value),
+        )
+        self.config.use_speed_profile_drive_speed = bool(
+            self.get_parameter('use_speed_profile_drive_speed').value
+        )
+        self.config.speed_profile_drive_blend = float(np.clip(
+            float(self.get_parameter('speed_profile_drive_blend').value),
+            0.0,
+            1.0,
+        ))
+        self.config.speed_profile_drive_lookahead_steps = max(
+            0,
+            int(self.get_parameter('speed_profile_drive_lookahead_steps').value),
+        )
+        self.config.speed_profile_drive_use_min_lookahead = bool(
+            self.get_parameter('speed_profile_drive_use_min_lookahead').value
+        )
+        self.config.speed_profile_drive_max_accel = max(
+            0.0,
+            float(self.get_parameter('speed_profile_drive_max_accel').value),
+        )
+        self.config.speed_profile_drive_max_decel = max(
+            0.0,
+            float(self.get_parameter('speed_profile_drive_max_decel').value),
+        )
         self.config.min_speed = float(self.get_parameter('min_speed').value)
         self.config.max_speed = max(
             self.config.min_speed,
@@ -417,8 +487,37 @@ class MPPI_Node(Node):
         ## MPPI call
         self.mppi.update(jnp.asarray(state_c_0), jnp.asarray(reference_traj))
         mppi_control = numpify(self.mppi.a_opt[0]) * self.config.norm_params[0, :2]/2
+        prev_speed_command = float(self.control[1])
+        mppi_speed_command = float(mppi_control[1]) * self.config.sim_time_step + twist.linear.x
+        profile_speed_command = np.nan
+        speed_command = mppi_speed_command
+
+        if self.config.use_waypoint_speed_profile and self.config.use_speed_profile_drive_speed:
+            speed_idx = min(
+                self.config.speed_profile_drive_lookahead_steps,
+                reference_traj.shape[0] - 1,
+            )
+            if self.config.speed_profile_drive_use_min_lookahead:
+                profile_speed_command = float(np.min(reference_traj[:speed_idx + 1, 2]))
+            else:
+                profile_speed_command = float(reference_traj[speed_idx, 2])
+            blend = self.config.speed_profile_drive_blend
+            speed_command = (1.0 - blend) * mppi_speed_command + blend * profile_speed_command
+
+            if self.last_speed_command_time is None:
+                speed_command_dt = self.config.sim_time_step
+            else:
+                speed_command_dt = max(0.0, t1 - self.last_speed_command_time)
+            max_accel_step = self.config.speed_profile_drive_max_accel * speed_command_dt
+            max_decel_step = self.config.speed_profile_drive_max_decel * speed_command_dt
+            if max_accel_step > 0.0 and speed_command > prev_speed_command:
+                speed_command = min(speed_command, prev_speed_command + max_accel_step)
+            if max_decel_step > 0.0 and speed_command < prev_speed_command:
+                speed_command = max(speed_command, prev_speed_command - max_decel_step)
+        self.last_speed_command_time = t1
+
         self.control[0] = float(mppi_control[0]) * self.config.sim_time_step + self.control[0]
-        self.control[1] = float(mppi_control[1]) * self.config.sim_time_step + twist.linear.x
+        self.control[1] = speed_command
         self.control[0] = float(np.clip(
             self.control[0],
             -self.config.max_steering_angle,
@@ -449,6 +548,16 @@ class MPPI_Node(Node):
                 self.config.max_speed,
             )
             self.control[1] = float(max(self.control[1], startup_speed))
+
+        if self.speed_debug_pub.get_subscription_count() > 0:
+            speed_debug = np.array([
+                twist.linear.x,
+                mppi_speed_command,
+                profile_speed_command,
+                self.control[1],
+                self.config.speed_profile_drive_blend,
+            ], dtype=np.float32)
+            self.speed_debug_pub.publish(to_multiarray_f32(speed_debug))
 
         if np.isnan(self.control).any() or np.isinf(self.control).any():
             self.control = np.array([0.0, 0.0])
