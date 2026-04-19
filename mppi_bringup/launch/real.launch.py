@@ -33,7 +33,7 @@ def generate_launch_description():
     )
 
     pkg_share = get_package_share_directory('mppi_bringup')
-    csv_path = os.path.join(pkg_share, 'waypoints', 'sim', 'raceline3.csv')
+    csv_path = os.path.join(pkg_share, 'waypoints', 'sim', 'raceline5.csv')
 
     mppi_node = Node(
         package='mppi_example',
