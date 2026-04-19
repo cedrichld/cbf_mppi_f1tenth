@@ -36,7 +36,8 @@ except ImportError:
     from utils.jax_utils import numpify
     import utils.jax_utils as jax_utils
     from utils.Track import Track
-#jax.config.update("jax_compilation_cache_dir", "/home/nvidia/jax_cache") 
+jax.config.update("jax_compilation_cache_dir",
+                  os.environ.get("JAX_CACHE_DIR", os.path.expanduser("~/jax_cache")))
 
 
 ## This is a demosntration of how to use the MPPI planner with the Roboracer
