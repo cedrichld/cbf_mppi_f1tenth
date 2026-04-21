@@ -43,7 +43,7 @@ class MPPI():
             
             
     def update(self, env_state, reference_traj):
-        a_std, temperature, damping, reward_weights, norm_params, friction = self.runtime_params()
+        a_std, temperature, damping, reward_weights, cost_params, norm_params, friction = self.runtime_params()
         self.a_opt, self.a_cov = self.shift_prev_opt(self.a_opt, self.a_cov, a_std)
         for _ in range(self.n_iterations):
             self.a_opt, self.a_cov, self.states, self.traj_opt = self.iteration_step(
@@ -56,6 +56,7 @@ class MPPI():
                 temperature,
                 damping,
                 reward_weights,
+                cost_params,
                 norm_params,
                 friction,
             )
@@ -72,11 +73,23 @@ class MPPI():
             getattr(self.config, 'velocity_reward_weight', 0.0),
             getattr(self.config, 'yaw_reward_weight', 0.0),
         ]
+        cost_params = [
+            getattr(self.config, 'wall_cost_weight', 0.0) if getattr(self.config, 'wall_cost_enabled', False) else 0.0,
+            getattr(self.config, 'wall_cost_margin', 0.0),
+            getattr(self.config, 'wall_cost_power', 2.0),
+            getattr(self.config, 'slip_cost_weight', 0.0) if getattr(self.config, 'slip_cost_enabled', False) else 0.0,
+            getattr(self.config, 'slip_cost_beta_safe', 0.0),
+            getattr(self.config, 'latacc_cost_weight', 0.0) if getattr(self.config, 'latacc_cost_enabled', False) else 0.0,
+            getattr(self.config, 'latacc_cost_safe', 0.0),
+            getattr(self.config, 'steer_sat_cost_weight', 0.0) if getattr(self.config, 'steer_sat_cost_enabled', False) else 0.0,
+            getattr(self.config, 'steer_sat_soft_ratio', 0.0) * getattr(self.config, 'max_steering_angle', 0.0),
+        ]
         return (
             jnp.asarray(self.config.control_sample_std, dtype=jnp.float32),
             jnp.asarray(self.temperature, dtype=jnp.float32),
             jnp.asarray(self.damping, dtype=jnp.float32),
             jnp.asarray(reward_weights, dtype=jnp.float32),
+            jnp.asarray(cost_params, dtype=jnp.float32),
             jnp.asarray(self.config.norm_params, dtype=jnp.float32),
             jnp.asarray(self.config.friction, dtype=jnp.float32),
         )
@@ -98,7 +111,7 @@ class MPPI():
     
     @partial(jax.jit, static_argnums=(0))
     def iteration_step(self, a_opt, a_cov, rng_da, env_state, reference_traj,
-                       a_std, temperature, damping, reward_weights, norm_params, friction):
+                       a_std, temperature, damping, reward_weights, cost_params, norm_params, friction):
         rng_da, rng_da_split1, rng_da_split2 = jax.random.split(rng_da, 3)
         da = jax.random.truncated_normal(
             rng_da,
@@ -113,15 +126,16 @@ class MPPI():
         )
         
         if self.config.state_predictor in self.config.cartesian_models:
-            reward = jax.vmap(self.env.reward_fn_xy, in_axes=(0, None, None))(
-                states, reference_traj, reward_weights
+            reward = jax.vmap(self.env.reward_fn_xy, in_axes=(0, None, None, None))(
+                states, reference_traj, reward_weights, cost_params
             )
         else:
             reward = jax.vmap(self.env.reward_fn_sey, in_axes=(0, None, None))(
                 states, reference_traj, reward_weights
             ) # [n_samples, n_steps]          
-        
+        reward = jnp.nan_to_num(reward, nan=-1e6, posinf=-1e6, neginf=-1e6)
         R = jax.vmap(self.returns)(reward) # [n_samples, n_steps], pylint: disable=invalid-name
+        R = jnp.nan_to_num(R, nan=-1e6, posinf=-1e6, neginf=-1e6)
         w = jax.vmap(self.weights, (1, None, None), 1)(R, temperature, damping)  # [n_samples, n_steps]
         da_opt = jax.vmap(jnp.average, (1, None, 1))(da, 0, w)  # [n_steps, dim_a]
         a_opt = jnp.clip(a_opt + da_opt, -1.0, 1.0)  # [n_steps, dim_a]
@@ -153,9 +167,14 @@ class MPPI():
         # R: [n_samples]
         # R_stdzd = (R - jnp.min(R)) / ((jnp.max(R) - jnp.min(R)) + self.damping)
         # R_stdzd = R - jnp.max(R) # [n_samples] np.float32
-        R_stdzd = (R - jnp.max(R)) / ((jnp.max(R) - jnp.min(R)) + damping)  # pylint: disable=invalid-name
+        R_max = jnp.max(R)
+        R_min = jnp.min(R)
+        denom = jnp.maximum((R_max - R_min) + damping, 1e-6)
+        R_stdzd = (R - R_max) / denom  # pylint: disable=invalid-name
         w = jnp.exp(R_stdzd / temperature)  # [n_samples] np.float32
-        w = w/jnp.sum(w)  # [n_samples] np.float32
+        w_sum = jnp.sum(w)
+        uniform = jnp.ones_like(w) / w.shape[0]
+        w = jnp.where(w_sum > 0.0, w / w_sum, uniform)  # [n_samples] np.float32
         return w
     
     

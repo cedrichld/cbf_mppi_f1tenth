@@ -1,9 +1,14 @@
 import os
+from pathlib import Path
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-from functools import partial
+import yaml
 from numba import njit
+from PIL import Image
+from scipy.ndimage import distance_transform_edt
 
 try:
     from .utils import jax_utils
@@ -65,6 +70,8 @@ class InferEnv():
                 x1 = x.at[:5].set(x_k)
                 return (x1, 0, x1-x)
             self.update_fn = update_fn
+
+        self._init_wall_cost()
             
     @partial(jax.jit, static_argnums=(0,))
     def step(self, x, u, rng_key=None, norm_params=None, friction=None):
@@ -81,12 +88,14 @@ class InferEnv():
         """
         if reward_weights is None:
             reward_weights = jnp.array([1.0, 0.0, 0.0])
-        sey_reward = -jnp.linalg.norm(reference[1:, 4:6] - s[:, :2], ord=1, axis=1)
-        vel_reward = -jnp.abs(reference[1:, 2] - s[:, 3])
-        yaw_reward = -jnp.abs(jnp.sin(reference[1:, 3]) - jnp.sin(s[:, 4])) - \
-            jnp.abs(jnp.cos(reference[1:, 3]) - jnp.cos(s[:, 4]))
+        invalid_penalty = (~jnp.isfinite(s).all(axis=1)).astype(jnp.float32) * 1e3
+        s_safe = jnp.nan_to_num(s, nan=1e3, posinf=1e3, neginf=-1e3)
+        sey_reward = -jnp.linalg.norm(reference[1:, 4:6] - s_safe[:, :2], ord=1, axis=1)
+        vel_reward = -jnp.abs(reference[1:, 2] - s_safe[:, 3])
+        yaw_reward = -jnp.abs(jnp.sin(reference[1:, 3]) - jnp.sin(s_safe[:, 4])) - \
+            jnp.abs(jnp.cos(reference[1:, 3]) - jnp.cos(s_safe[:, 4]))
             
-        return reward_weights[0] * sey_reward + reward_weights[1] * vel_reward + reward_weights[2] * yaw_reward
+        return reward_weights[0] * sey_reward + reward_weights[1] * vel_reward + reward_weights[2] * yaw_reward - invalid_penalty
     
     def update_waypoints(self, waypoints):
         self.waypoints = waypoints
@@ -94,18 +103,62 @@ class InferEnv():
         self.waypoints_distances = np.linalg.norm(self.waypoints[1:, (1, 2)] - self.waypoints[:-1, (1, 2)], axis=1)
     
     @partial(jax.jit, static_argnums=(0,))
-    def reward_fn_xy(self, state, reference, reward_weights=None):
+    def reward_fn_xy(self, state, reference, reward_weights=None, cost_params=None):
         """
         reward function for the state s with respect to the reference trajectory
         """
         if reward_weights is None:
             reward_weights = jnp.array([1.0, 0.0, 0.0])
-        xy_reward = -jnp.linalg.norm(reference[1:, :2] - state[:, :2], ord=1, axis=1)
-        vel_reward = -jnp.abs(reference[1:, 2] - state[:, 3])
-        yaw_reward = -jnp.abs(jnp.sin(reference[1:, 3]) - jnp.sin(state[:, 4])) - \
-            jnp.abs(jnp.cos(reference[1:, 3]) - jnp.cos(state[:, 4]))
+        if cost_params is None:
+            cost_params = jnp.zeros((9,), dtype=jnp.float32)
+        invalid_penalty = (~jnp.isfinite(state).all(axis=1)).astype(jnp.float32) * 1e3
+        state_safe = jnp.nan_to_num(state, nan=1e3, posinf=1e3, neginf=-1e3)
+        xy_reward = -jnp.linalg.norm(reference[1:, :2] - state_safe[:, :2], ord=1, axis=1)
+        vel_reward = -jnp.abs(reference[1:, 2] - state_safe[:, 3])
+        yaw_reward = -jnp.abs(jnp.sin(reference[1:, 3]) - jnp.sin(state_safe[:, 4])) - \
+            jnp.abs(jnp.cos(reference[1:, 3]) - jnp.cos(state_safe[:, 4]))
+        
+        reward = (
+            reward_weights[0] * xy_reward 
+            + reward_weights[1] * vel_reward 
+            + reward_weights[2] * yaw_reward
+            - invalid_penalty
+        )
+
+        wall_weight = cost_params[0]
+        wall_margin = cost_params[1]
+        wall_power = cost_params[2]
+        slip_weight = cost_params[3]
+        beta_safe = cost_params[4]
+        latacc_weight = cost_params[5]
+        latacc_safe = cost_params[6]
+        steer_sat_weight = cost_params[7]
+        steer_soft = cost_params[8]
+
+        if self.wall_sdf is not None:
+            wall_dist = self.sample_wall_distance(state_safe[:, :2])
+            wall_penalty = jnp.maximum(0.0, wall_margin - wall_dist) ** wall_power
+            reward -= wall_weight * wall_penalty
+
+        beta = jnp.abs(state_safe[:, 6])
+        slip_penalty = self.safe_hinge_square(beta, beta_safe)
+        reward -= slip_weight * slip_penalty
+        
+        latacc = jnp.abs(state_safe[:, 3] * state_safe[:, 5])
+        latacc_penalty = self.safe_hinge_square(latacc, latacc_safe)
+        reward -= latacc_weight * latacc_penalty
+
+        steer_abs = jnp.abs(state_safe[:, 2])
+        steer_penalty = self.safe_hinge_square(steer_abs, steer_soft)
+        reward -= steer_sat_weight * steer_penalty
             
-        return reward_weights[0] * xy_reward + reward_weights[1] * vel_reward + reward_weights[2] * yaw_reward
+        return reward
+
+    @partial(jax.jit, static_argnums=(0,))
+    def safe_hinge_square(self, value, threshold, cap=1e3):
+        violation = jnp.maximum(0.0, value - threshold)
+        violation = jnp.minimum(violation, cap)
+        return jnp.square(violation)
     
     
     def calc_ref_trajectory_kinematic(self, state, cx, cy, cyaw, sp):
@@ -241,6 +294,74 @@ class InferEnv():
         # reference[2] = np.where(reference[2] - speed > 5.0, speed + 5.0, reference[2])
         self.reference = reference.T
         return reference.T, ind
+    
+    def _init_wall_cost(self):
+        signature = (
+            bool(getattr(self.config, 'wall_cost_enabled', False)),
+            str(getattr(self.config, 'wall_cost_map_yaml', '')),
+        )
+        if getattr(self, 'wall_cost_signature', None) == signature:
+            return
+
+        self.wall_sdf = None
+        self.wall_origin = None
+        self.wall_resolution = None
+        self.wall_cost_signature = signature
+
+        if not getattr(self.config, 'wall_cost_enabled', False):
+            return
+        map_yaml = getattr(self.config, 'wall_cost_map_yaml', '')
+        if not map_yaml:
+            return
+        
+        sdf, origin_xy, resolution = load_wall_distance_field(map_yaml)
+        self.wall_sdf = jnp.asarray(sdf, dtype=jnp.float32)
+        self.wall_origin = jnp.asarray(origin_xy, dtype=jnp.float32)
+        self.wall_resolution = float(resolution)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def sample_wall_distance(self, xy):
+        if self.wall_sdf is None:
+            return jnp.ones((xy.shape[0],), dtype=jnp.float32) * 100.0
+
+        col = jnp.floor((xy[:, 0] - self.wall_origin[0]) / self.wall_resolution).astype(jnp.int32)
+        row = jnp.floor((xy[:, 1] - self.wall_origin[1]) / self.wall_resolution).astype(jnp.int32)
+
+        h, w = self.wall_sdf.shape
+        valid = jnp.logical_and(row >= 0, row < h)
+        valid = jnp.logical_and(valid, col >= 0)
+        valid = jnp.logical_and(valid, col < w)
+        row = jnp.clip(row, 0, h-1)
+        col = jnp.clip(col, 0, w-1)
+
+        return jnp.where(valid, self.wall_sdf[row, col], 0.0)
+
+def load_wall_distance_field(map_yaml):
+    map_yaml = Path(map_yaml).expanduser().resolve()
+    with map_yaml.open('r', encoding='utf-8') as stream:
+        map_cfg = yaml.safe_load(stream)
+
+    image_path = Path(map_cfg['image'])
+    if not image_path.is_absolute():
+        image_path = (map_yaml.parent / image_path).resolve()
+
+    image = np.array(Image.open(image_path).convert('L'), dtype=np.uint8)
+    image = np.flipud(image)
+
+    resolution = float(map_cfg['resolution'])
+    origin_xy = np.asarray(map_cfg['origin'][:2], dtype=np.float32)
+    negate = int(map_cfg.get('negate', 0))
+    occupied_thresh = float(map_cfg.get('occupied_thresh', 0.65))
+
+    if negate:
+        occ_prob = image.astype(np.float32) / 255.0
+    else:
+        occ_prob = (255.0 - image.astype(np.float32)) / 255.0
+
+    occupied = occ_prob >= occupied_thresh
+    wall_sdf = distance_transform_edt(~occupied).astype(np.float32) * resolution
+    return wall_sdf, origin_xy, resolution
+
 
 @jax.jit
 def get_reference_trajectory_jax(predicted_speeds, dist_from_segment_start, idx, 

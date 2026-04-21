@@ -187,6 +187,21 @@ class MPPI_Node(Node):
             'sampled_line_width': 0.025,
             'sampled_trajectory_count': 64,
             'sampled_trajectory_alpha': 0.18,
+            'wall_cost_enabled': False,
+            'wall_cost_weight': 0.0,
+            'wall_cost_margin': 0.3,
+            'wall_cost_power': 2.0,
+            'wall_cost_map_yaml': '',
+            'slip_cost_enabled': False,
+            'slip_cost_weight': 0.0,
+            'slip_cost_beta_safe': 0.2,
+            'latacc_cost_enabled': False,
+            'latacc_cost_weight': 0.0,
+            'latacc_cost_safe': 8.0,
+            'steer_sat_cost_enabled': False,
+            'steer_sat_cost_weight': 0.0,
+            'steer_sat_soft_ratio': 0.85,
+
         }
         for key, value in defaults.items():
             if not hasattr(self.config, key):
@@ -201,6 +216,7 @@ class MPPI_Node(Node):
             'is_sim': bool(self.config.is_sim),
             'wpt_path_absolute': bool(self.config.wpt_path_absolute),
             'wpt_path': str(self.config.wpt_path),
+            'wall_cost_map_yaml': str(self.config.wall_cost_map_yaml),
             'map_dir': str(self.config.map_dir),
             'map_ind': int(self.config.map_ind),
             'state_predictor': str(self.config.state_predictor),
@@ -225,6 +241,19 @@ class MPPI_Node(Node):
             'xy_reward_weight': float(self.config.xy_reward_weight),
             'velocity_reward_weight': float(self.config.velocity_reward_weight),
             'yaw_reward_weight': float(self.config.yaw_reward_weight),
+            'wall_cost_enabled': bool(self.config.wall_cost_enabled),
+            'wall_cost_weight': float(self.config.wall_cost_weight),
+            'wall_cost_margin': float(self.config.wall_cost_margin),
+            'wall_cost_power': float(self.config.wall_cost_power),
+            'slip_cost_enabled': bool(self.config.slip_cost_enabled),
+            'slip_cost_weight': float(self.config.slip_cost_weight),
+            'slip_cost_beta_safe': float(self.config.slip_cost_beta_safe),
+            'latacc_cost_enabled': bool(self.config.latacc_cost_enabled),
+            'latacc_cost_weight': float(self.config.latacc_cost_weight),
+            'latacc_cost_safe': float(self.config.latacc_cost_safe),
+            'steer_sat_cost_enabled': bool(self.config.steer_sat_cost_enabled),
+            'steer_sat_cost_weight': float(self.config.steer_sat_cost_weight),
+            'steer_sat_soft_ratio': float(self.config.steer_sat_soft_ratio),
             'use_waypoint_speed_profile': bool(self.config.use_waypoint_speed_profile),
             'speed_profile_scale': float(self.config.speed_profile_scale),
             'speed_profile_min_speed': float(self.config.speed_profile_min_speed),
@@ -257,6 +286,7 @@ class MPPI_Node(Node):
             self.config.is_sim = bool(self.get_parameter('is_sim').value)
             self.config.wpt_path_absolute = bool(self.get_parameter('wpt_path_absolute').value)
             self.config.wpt_path = str(self.get_parameter('wpt_path').value)
+            self.config.wall_cost_map_yaml = str(self.get_parameter('wall_cost_map_yaml').value)
             self.config.map_dir = str(self.get_parameter('map_dir').value)
             self.config.map_ind = int(self.get_parameter('map_ind').value)
             self.config.state_predictor = str(self.get_parameter('state_predictor').value)
@@ -287,6 +317,47 @@ class MPPI_Node(Node):
         self.config.xy_reward_weight = float(self.get_parameter('xy_reward_weight').value)
         self.config.velocity_reward_weight = float(self.get_parameter('velocity_reward_weight').value)
         self.config.yaw_reward_weight = float(self.get_parameter('yaw_reward_weight').value)
+        self.config.wall_cost_enabled = bool(self.get_parameter('wall_cost_enabled').value)
+        self.config.wall_cost_weight = max(
+            0.0,
+            float(self.get_parameter('wall_cost_weight').value),
+        )
+        self.config.wall_cost_margin = max(
+            0.0,
+            float(self.get_parameter('wall_cost_margin').value),
+        )
+        self.config.wall_cost_power = max(
+            1.0,
+            float(self.get_parameter('wall_cost_power').value),
+        )
+        self.config.slip_cost_enabled = bool(self.get_parameter('slip_cost_enabled').value)
+        self.config.slip_cost_weight = max(
+            0.0,
+            float(self.get_parameter('slip_cost_weight').value),
+        )
+        self.config.slip_cost_beta_safe = max(
+            0.0,
+            float(self.get_parameter('slip_cost_beta_safe').value),
+        )
+        self.config.latacc_cost_enabled = bool(self.get_parameter('latacc_cost_enabled').value)
+        self.config.latacc_cost_weight = max(
+            0.0,
+            float(self.get_parameter('latacc_cost_weight').value),
+        )
+        self.config.latacc_cost_safe = max(
+            0.0,
+            float(self.get_parameter('latacc_cost_safe').value),
+        )
+        self.config.steer_sat_cost_enabled = bool(self.get_parameter('steer_sat_cost_enabled').value)
+        self.config.steer_sat_cost_weight = max(
+            0.0,
+            float(self.get_parameter('steer_sat_cost_weight').value),
+        )
+        self.config.steer_sat_soft_ratio = float(np.clip(
+            float(self.get_parameter('steer_sat_soft_ratio').value),
+            0.0,
+            1.0,
+        ))
         self.config.use_waypoint_speed_profile = bool(self.get_parameter('use_waypoint_speed_profile').value)
         self.config.speed_profile_scale = max(
             0.0,
@@ -364,6 +435,7 @@ class MPPI_Node(Node):
         if hasattr(self, 'infer_env'):
             self.infer_env.config = self.config
             self.infer_env.norm_params = self.config.norm_params
+            self.infer_env._init_wall_cost()
         if hasattr(self, 'mppi'):
             self.mppi.temperature = self.config.temperature
             self.mppi.damping = self.config.damping
@@ -546,7 +618,12 @@ class MPPI_Node(Node):
             else:
                 profile_speed_command = float(reference_traj[speed_idx, 2])
             blend = self.config.speed_profile_drive_blend
-            speed_command = (1.0 - blend) * mppi_speed_command + blend * profile_speed_command
+            if np.isnan(mppi_speed_command):
+                mppi_speed_command = prev_speed_command
+            if blend >= 1.0 - 1e-6:
+                speed_command = profile_speed_command
+            else:
+                speed_command = (1.0 - blend) * mppi_speed_command + blend * profile_speed_command
 
             if self.last_speed_command_time is None:
                 speed_command_dt = self.config.sim_time_step
