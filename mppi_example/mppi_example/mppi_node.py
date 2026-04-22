@@ -105,7 +105,14 @@ class MPPI_Node(Node):
         self.get_logger().info('MPPI initialized')
         self.hz = []
         self.last_speed_command_time = None
-        
+        self.prev_pose_time = None
+        self.prev_pose_xy = None
+        self.prev_pose_yaw = None
+        self.state_est_vx = None
+        self.state_est_vy = 0.0
+        self.state_est_wz = 0.0
+        self.state_est_method_enabled = bool(self.config.use_pose_delta_state_estimate)
+
         
         qos = rclpy.qos.QoSProfile(history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST,
                                    depth=1,
@@ -201,6 +208,7 @@ class MPPI_Node(Node):
             'speed_profile_drive_max_accel': 0.0,
             'speed_profile_drive_max_decel': 0.0,
             'startup_speed': float(self.config.init_vel) * 2.0,
+            'use_pose_delta_state_estimate': False,
             'min_speed': 0.0,
             'max_speed': 20.0,
             'max_steering_angle': 0.4189,
@@ -256,6 +264,7 @@ class MPPI_Node(Node):
             'ref_vel': float(self.config.ref_vel),
             'init_vel': float(self.config.init_vel),
             'startup_speed': float(self.config.startup_speed),
+            'use_pose_delta_state_estimate': bool(self.config.use_pose_delta_state_estimate),
             'friction': float(self.config.friction),
             'n_iterations': int(self.config.n_iterations),
             'control_sample_std_steer': float(self.config.control_sample_std[0]),
@@ -326,6 +335,9 @@ class MPPI_Node(Node):
         self.config.ref_vel = float(self.get_parameter('ref_vel').value)
         self.config.init_vel = float(self.get_parameter('init_vel').value)
         self.config.startup_speed = float(self.get_parameter('startup_speed').value)
+        self.config.use_pose_delta_state_estimate = bool(
+            self.get_parameter('use_pose_delta_state_estimate').value
+        )
         self.config.friction = float(self.get_parameter('friction').value)
         self.config.n_iterations = max(1, int(self.get_parameter('n_iterations').value))
         self.config.control_sample_std = [
@@ -465,6 +477,11 @@ class MPPI_Node(Node):
             self.mppi.damping = self.config.damping
             self.mppi.n_iterations = self.config.n_iterations
 
+        if hasattr(self, 'state_est_method_enabled'):
+            if self.state_est_method_enabled != self.config.use_pose_delta_state_estimate:
+                self.reset_state_estimator()
+                self.state_est_method_enabled = bool(self.config.use_pose_delta_state_estimate)
+
     def resolve_map_dir(self):
         map_dir = Path(self.config.map_dir)
         if not map_dir.is_absolute():
@@ -480,6 +497,107 @@ class MPPI_Node(Node):
         siny_cosp = 2.0 * (w * z + x * y)
         cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
         return np.arctan2(siny_cosp, cosy_cosp)
+
+    @staticmethod
+    def wrap_angle(angle):
+        return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
+    @staticmethod
+    def stamp_to_sec(stamp):
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+    def reset_state_estimator(self):
+        self.prev_pose_time = None
+        self.prev_pose_xy = None
+        self.prev_pose_yaw = None
+        self.state_est_vx = None
+        self.state_est_vy = 0.0
+        self.state_est_wz = 0.0
+
+    def estimate_vehicle_state(self, pose, theta, twist, callback_time):
+        raw_vx = float(twist.linear.x)
+        raw_vy = float(twist.linear.y)
+        raw_wz = float(twist.angular.z)
+        raw_beta = np.arctan2(raw_vy, max(abs(raw_vx), 1e-6))
+
+        if self.config.is_sim or not self.config.use_pose_delta_state_estimate:
+            return max(raw_vx, self.config.init_vel), raw_vy, raw_wz, raw_beta
+
+        pose_xy = np.asarray([pose.position.x, pose.position.y], dtype=float)
+        commanded_speed = float(np.clip(
+            self.control[1],
+            self.config.min_speed,
+            self.config.max_speed,
+        ))
+
+        if (
+            self.prev_pose_time is None
+            or self.prev_pose_xy is None
+            or self.prev_pose_yaw is None
+        ):
+            self.prev_pose_time = callback_time
+            self.prev_pose_xy = pose_xy
+            self.prev_pose_yaw = theta
+            seed_speed = max(raw_vx, commanded_speed, self.config.init_vel)
+            self.state_est_vx = seed_speed
+            self.state_est_vy = raw_vy
+            self.state_est_wz = raw_wz
+            return seed_speed, raw_vy, raw_wz, np.arctan2(raw_vy, max(seed_speed, 1e-6))
+
+        dt = callback_time - self.prev_pose_time
+        if not np.isfinite(dt) or dt <= 1e-3 or dt > 0.5:
+            self.prev_pose_time = callback_time
+            self.prev_pose_xy = pose_xy
+            self.prev_pose_yaw = theta
+            fallback_vx = max(
+                raw_vx,
+                commanded_speed,
+                self.state_est_vx if self.state_est_vx is not None else self.config.init_vel,
+            )
+            fallback_vy = self.state_est_vy
+            fallback_wz = self.state_est_wz
+            return fallback_vx, fallback_vy, fallback_wz, np.arctan2(
+                fallback_vy,
+                max(abs(fallback_vx), 1e-6),
+            )
+
+        world_vel = (pose_xy - self.prev_pose_xy) / dt
+        cos_th = np.cos(theta)
+        sin_th = np.sin(theta)
+        vx_pose = cos_th * world_vel[0] + sin_th * world_vel[1]
+        vy_pose = -sin_th * world_vel[0] + cos_th * world_vel[1]
+        wz_pose = self.wrap_angle(theta - self.prev_pose_yaw) / dt
+
+        vx_pose = float(np.clip(vx_pose, -self.config.max_speed, self.config.max_speed))
+        vy_pose = float(np.clip(vy_pose, -3.0, 3.0))
+        wz_pose = float(np.clip(wz_pose, -8.0, 8.0))
+
+        speed_obs_terms = [vx_pose]
+        if np.isfinite(raw_vx):
+            speed_obs_terms.append(raw_vx)
+        speed_obs = float(np.mean(speed_obs_terms))
+        prev_vx = self.state_est_vx if self.state_est_vx is not None else speed_obs
+        vx_est = 0.55 * speed_obs + 0.30 * commanded_speed + 0.15 * prev_vx
+        vx_est = float(np.clip(vx_est, self.config.min_speed, self.config.max_speed))
+        vx_est = max(vx_est, self.config.init_vel)
+
+        vy_obs = 0.8 * vy_pose + 0.2 * raw_vy
+        vy_est = 0.35 * vy_obs + 0.65 * self.state_est_vy
+        vy_est = float(np.clip(vy_est, -2.0, 2.0))
+
+        wz_obs = 0.85 * wz_pose + 0.15 * raw_wz
+        wz_est = 0.45 * wz_obs + 0.55 * self.state_est_wz
+        wz_est = float(np.clip(wz_est, -6.0, 6.0))
+
+        self.prev_pose_time = callback_time
+        self.prev_pose_xy = pose_xy
+        self.prev_pose_yaw = theta
+        self.state_est_vx = vx_est
+        self.state_est_vy = vy_est
+        self.state_est_wz = wz_est
+
+        beta_est = np.arctan2(vy_est, max(abs(vx_est), 1e-6))
+        return vx_est, vy_est, wz_est, beta_est
 
     @staticmethod
     def make_point(x, y, z=0.05):
@@ -640,22 +758,27 @@ class MPPI_Node(Node):
         self.get_params()
         pose = pose_msg.pose.pose
         twist = pose_msg.twist.twist
-
-        # Beta calculated by the arctan of the lateral velocity and the longitudinal velocity
-        beta = np.arctan2(twist.linear.y, twist.linear.x)
-
         theta = self.quaternion_to_yaw(pose.orientation)
+        callback_time = self.stamp_to_sec(pose_msg.header.stamp)
+        if callback_time <= 0.0:
+            callback_time = t1
+        vx_state, vy_state, wz_state, beta = self.estimate_vehicle_state(
+            pose,
+            theta,
+            twist,
+            callback_time,
+        )
 
         state_c_0 = np.asarray([
             pose.position.x,
             pose.position.y,
             self.control[0],
-            max(twist.linear.x, self.config.init_vel),
+            vx_state,
             theta,
-            twist.angular.z,
+            wz_state,
             beta,
         ])
-        find_waypoint_vel = max(self.config.ref_vel, twist.linear.x)
+        find_waypoint_vel = max(self.config.ref_vel, vx_state)
         
         reference_traj, waypoint_ind = self.infer_env.get_refernece_traj(state_c_0, find_waypoint_vel, self.config.n_steps)
 
@@ -663,7 +786,7 @@ class MPPI_Node(Node):
         self.mppi.update(jnp.asarray(state_c_0), jnp.asarray(reference_traj))
         mppi_control = numpify(self.mppi.a_opt[0]) * self.config.norm_params[0, :2]/2
         prev_speed_command = float(self.control[1])
-        mppi_speed_command = float(mppi_control[1]) * self.config.sim_time_step + twist.linear.x
+        mppi_speed_command = float(mppi_control[1]) * self.config.sim_time_step + vx_state
         profile_speed_command = np.nan
         speed_command = mppi_speed_command
 
@@ -722,7 +845,7 @@ class MPPI_Node(Node):
         self.publish_reward_debug(reference_traj)
         self.publish_visualization(reference_traj)
 
-        if twist.linear.x < self.config.init_vel:
+        if vx_state < self.config.init_vel:
             startup_speed = np.clip(
                 self.config.startup_speed,
                 self.config.min_speed,
@@ -732,7 +855,7 @@ class MPPI_Node(Node):
 
         if self.speed_debug_pub.get_subscription_count() > 0:
             speed_debug = np.array([
-                twist.linear.x,
+                vx_state,
                 mppi_speed_command,
                 profile_speed_command,
                 self.control[1],

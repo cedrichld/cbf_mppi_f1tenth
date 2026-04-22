@@ -18,6 +18,7 @@ lmppi_node:
     # ref_vel: 5.0                  # OLD: Legacy constant-speed reference seed. Mostly bypassed when profile is on.
     init_vel: 4.0                 # Minimum speed assumed by the rollout model at startup/very low speed.
     startup_speed: 4.0            # Minimum /drive.speed while measured speed is below init_vel.
+    use_pose_delta_state_estimate: false # Sim odom twist is already good; leave the hardware estimator off.
     friction: 0.41                 # Model-only tire/friction belief for dynamic_ST rollouts; tune empirically.
     # n_iterations: 1               # MPPI update passes per odom callback. More can improve solve quality but costs time.
 
