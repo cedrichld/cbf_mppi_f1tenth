@@ -6,7 +6,7 @@ lmppi_node:
     is_sim: false                  # true: /ego_racecar/odom; false: /pf/pose/odom.
     state_predictor: dynamic_ST   # Rollout model. dynamic_ST includes yaw rate/slip; kinematic_ST is simpler.
     n_samples: 1024               # Number of sampled control sequences. More is steadier but slower.
-    n_steps: 8 #try lower                   # Rollout horizon length. At dt=0.1, 12 steps = 1.2s lookahead.
+    n_steps: 10 #try lower                   # Rollout horizon length. At dt=0.1, 12 steps = 1.2s lookahead.
     sim_time_step: 0.1            # Rollout integration/control timestep used inside MPPI.
     random_seed: 527787           # Sampling seed. Keep fixed for repeatable tuning runs.
     render: true                  # true keeps optimal/sampled rollouts available for visualization.
@@ -19,7 +19,7 @@ lmppi_node:
     init_vel: 2.0                 # Minimum speed assumed by the rollout model at startup/very low speed.
     startup_speed: 1.0            # Minimum /drive.speed while measured speed is below init_vel.
     use_pose_delta_state_estimate: true # Real car: estimate vx / yaw-rate from PF pose deltas plus command prior.
-    friction: 0.41                # Model-only tire/friction belief for dynamic_ST rollouts; tune empirically.
+    friction: 0.35                # Model-only tire/friction belief for dynamic_ST rollouts; tune empirically.
     # n_iterations: 1               # MPPI update passes per odom callback. More can improve solve quality but costs time.
 
     # Use the MPPI raceline CSV vx_mps column for turn-aware reference spacing.
