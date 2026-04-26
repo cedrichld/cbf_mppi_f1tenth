@@ -6,19 +6,28 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    params_file = LaunchConfiguration('params_file')
+    predictor_params_file = LaunchConfiguration('predictor_params_file')
+    detector_params_file = LaunchConfiguration('detector_params_file')
+
+    detector = Node(
+        package='opponent_predictor',
+        executable='opponent_lidar_detector_node',
+        name='opponent_lidar_detector',
+        output='screen',
+        parameters=[detector_params_file],
+    )
 
     predictor = Node(
         package='opponent_predictor',
         executable='opponent_predictor_node',
         name='opponent_predictor',
         output='screen',
-        parameters=[params_file],
+        parameters=[predictor_params_file],
     )
 
     return LaunchDescription([
         DeclareLaunchArgument(
-            'params_file',
+            'predictor_params_file',
             default_value=PathJoinSubstitution([
                 FindPackageShare('opponent_predictor'),
                 'config',
@@ -26,5 +35,15 @@ def generate_launch_description():
             ]),
             description='YAML file with opponent predictor parameters.',
         ),
+        DeclareLaunchArgument(
+            'detector_params_file',
+            default_value=PathJoinSubstitution([
+                FindPackageShare('opponent_predictor'),
+                'config',
+                'lidar_detector.yaml',
+            ]),
+            description='YAML file with LiDAR opponent detector parameters.',
+        ),
+        detector,
         predictor,
     ])
