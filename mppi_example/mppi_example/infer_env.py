@@ -110,7 +110,7 @@ class InferEnv():
         if reward_weights is None:
             reward_weights = jnp.array([1.0, 0.0, 0.0])
         if cost_params is None:
-            cost_params = jnp.zeros((13,), dtype=jnp.float32)
+            cost_params = jnp.zeros((20,), dtype=jnp.float32)
         if opponent_traj is None:
             opponent_traj = jnp.zeros((state.shape[0], 2), dtype=jnp.float32)
         invalid_penalty = (~jnp.isfinite(state).all(axis=1)).astype(jnp.float32) * 1e3
@@ -140,6 +140,13 @@ class InferEnv():
         opponent_radius = cost_params[10]
         opponent_power = cost_params[11]
         opponent_discount = cost_params[12]
+        opponent_mode = cost_params[13]
+        opponent_follow_weight = cost_params[14]
+        opponent_follow_distance = cost_params[15]
+        opponent_same_lane_width = cost_params[16]
+        opponent_pass_weight = cost_params[17]
+        opponent_pass_lateral_offset = cost_params[18]
+        opponent_pass_longitudinal_window = cost_params[19]
 
         if self.wall_sdf is not None:
             wall_dist = self.sample_wall_distance(state_safe[:, :2])
@@ -163,6 +170,31 @@ class InferEnv():
         opponent_penalty = jnp.maximum(0.0, opponent_radius - opponent_dist) ** opponent_power
         opponent_discount_steps = opponent_discount ** jnp.arange(state_safe.shape[0], dtype=jnp.float32)
         reward -= opponent_weight * opponent_discount_steps * opponent_penalty
+
+        ref_yaw = reference[1:state_safe.shape[0] + 1, 3]
+        tangent = jnp.stack([jnp.cos(ref_yaw), jnp.sin(ref_yaw)], axis=1)
+        normal = jnp.stack([-jnp.sin(ref_yaw), jnp.cos(ref_yaw)], axis=1)
+        rel_xy = state_safe[:, :2] - opponent_xy
+        long_rel = jnp.sum(rel_xy * tangent, axis=1)
+        lat_rel = jnp.sum(rel_xy * normal, axis=1)
+
+        same_lane_scale = jnp.maximum(opponent_same_lane_width, 1e-3)
+        same_lane_factor = jnp.maximum(0.0, 1.0 - jnp.abs(lat_rel) / same_lane_scale)
+        behind_mask = (long_rel < 0.0).astype(jnp.float32)
+        follow_violation = jnp.maximum(0.0, opponent_follow_distance + long_rel)
+        follow_active = (jnp.abs(opponent_mode - 0.0) < 0.5).astype(jnp.float32)
+        follow_penalty = follow_active * behind_mask * same_lane_factor * jnp.square(follow_violation)
+        reward -= opponent_follow_weight * opponent_discount_steps * follow_penalty
+
+        pass_left_active = (jnp.abs(opponent_mode - 2.0) < 0.5).astype(jnp.float32)
+        pass_right_active = (jnp.abs(opponent_mode - 3.0) < 0.5).astype(jnp.float32)
+        pass_side = pass_left_active - pass_right_active
+        pass_active = pass_left_active + pass_right_active
+        pass_window = jnp.maximum(opponent_pass_longitudinal_window, 1e-3)
+        pass_window_factor = jnp.maximum(0.0, 1.0 - jnp.abs(long_rel) / pass_window)
+        pass_violation = jnp.maximum(0.0, opponent_pass_lateral_offset - pass_side * lat_rel)
+        pass_penalty = pass_active * pass_window_factor * jnp.square(pass_violation)
+        reward -= opponent_pass_weight * opponent_discount_steps * pass_penalty
             
         return reward
 
@@ -373,6 +405,13 @@ class InferEnv():
                 getattr(self.config, 'opponent_cost_radius', 0.8),
                 getattr(self.config, 'opponent_cost_power', 2.0),
                 getattr(self.config, 'opponent_cost_discount', 1.0),
+                getattr(self.config, 'opponent_behavior_mode_id', 0.0),
+                getattr(self.config, 'opponent_follow_weight', 0.0),
+                getattr(self.config, 'opponent_follow_distance', 1.2),
+                getattr(self.config, 'opponent_same_lane_width', 0.7),
+                getattr(self.config, 'opponent_pass_weight', 0.0),
+                getattr(self.config, 'opponent_pass_lateral_offset', 0.55),
+                getattr(self.config, 'opponent_pass_longitudinal_window', 1.5),
             ], dtype=np.float32)
         else:
             cost_params = np.asarray(cost_params, dtype=np.float32)
@@ -395,8 +434,12 @@ class InferEnv():
                 'cost_latacc_sum': 0.0,
                 'cost_steer_sat_sum': 0.0,
                 'cost_opponent_sum': 0.0,
+                'cost_opponent_follow_sum': 0.0,
+                'cost_opponent_pass_sum': 0.0,
                 'min_wall_dist': 100.0,
                 'min_opponent_dist': 100.0,
+                'min_opponent_longitudinal_rel': 0.0,
+                'max_abs_opponent_lateral_rel': 0.0,
                 'max_beta': 0.0,
                 'max_latacc': 0.0,
                 'max_abs_steer': 0.0,
@@ -433,6 +476,13 @@ class InferEnv():
         opponent_radius = float(cost_params[10])
         opponent_power = float(cost_params[11])
         opponent_discount = float(cost_params[12])
+        opponent_mode = float(cost_params[13])
+        opponent_follow_weight = float(cost_params[14])
+        opponent_follow_distance = float(cost_params[15])
+        opponent_same_lane_width = float(cost_params[16])
+        opponent_pass_weight = float(cost_params[17])
+        opponent_pass_lateral_offset = float(cost_params[18])
+        opponent_pass_longitudinal_window = float(cost_params[19])
 
         if self.wall_sdf is not None:
             wall_dist = np.asarray(self.sample_wall_distance(jnp.asarray(state_safe[:, :2])))
@@ -465,6 +515,42 @@ class InferEnv():
         opponent_discount_steps = opponent_discount ** np.arange(n, dtype=np.float32)
         weighted_opponent = opponent_weight * opponent_discount_steps * opponent_penalty
 
+        ref_yaw = ref[:, 3]
+        tangent = np.stack([np.cos(ref_yaw), np.sin(ref_yaw)], axis=1)
+        normal = np.stack([-np.sin(ref_yaw), np.cos(ref_yaw)], axis=1)
+        rel_xy = state_safe[:, :2] - opponent_xy
+        long_rel = np.sum(rel_xy * tangent, axis=1)
+        lat_rel = np.sum(rel_xy * normal, axis=1)
+
+        same_lane_scale = max(opponent_same_lane_width, 1e-3)
+        same_lane_factor = np.maximum(0.0, 1.0 - np.abs(lat_rel) / same_lane_scale)
+        behind_mask = (long_rel < 0.0).astype(np.float32)
+        follow_violation = np.maximum(0.0, opponent_follow_distance + long_rel)
+        follow_active = 1.0 if abs(opponent_mode - 0.0) < 0.5 else 0.0
+        weighted_opponent_follow = (
+            opponent_follow_weight
+            * opponent_discount_steps
+            * follow_active
+            * behind_mask
+            * same_lane_factor
+            * np.square(follow_violation)
+        )
+
+        pass_left_active = 1.0 if abs(opponent_mode - 2.0) < 0.5 else 0.0
+        pass_right_active = 1.0 if abs(opponent_mode - 3.0) < 0.5 else 0.0
+        pass_side = pass_left_active - pass_right_active
+        pass_active = pass_left_active + pass_right_active
+        pass_window = max(opponent_pass_longitudinal_window, 1e-3)
+        pass_window_factor = np.maximum(0.0, 1.0 - np.abs(long_rel) / pass_window)
+        pass_violation = np.maximum(0.0, opponent_pass_lateral_offset - pass_side * lat_rel)
+        weighted_opponent_pass = (
+            opponent_pass_weight
+            * opponent_discount_steps
+            * pass_active
+            * pass_window_factor
+            * np.square(pass_violation)
+        )
+
         total = (
             weighted_xy
             + weighted_vel
@@ -475,8 +561,19 @@ class InferEnv():
             - weighted_latacc
             - weighted_steer
             - weighted_opponent
+            - weighted_opponent_follow
+            - weighted_opponent_pass
         )
-        total_cost = invalid_penalty + weighted_wall + weighted_slip + weighted_latacc + weighted_steer + weighted_opponent
+        total_cost = (
+            invalid_penalty
+            + weighted_wall
+            + weighted_slip
+            + weighted_latacc
+            + weighted_steer
+            + weighted_opponent
+            + weighted_opponent_follow
+            + weighted_opponent_pass
+        )
 
         return {
             'reward_total_sum': float(np.sum(total)),
@@ -492,8 +589,12 @@ class InferEnv():
             'cost_latacc_sum': float(np.sum(weighted_latacc)),
             'cost_steer_sat_sum': float(np.sum(weighted_steer)),
             'cost_opponent_sum': float(np.sum(weighted_opponent)),
+            'cost_opponent_follow_sum': float(np.sum(weighted_opponent_follow)),
+            'cost_opponent_pass_sum': float(np.sum(weighted_opponent_pass)),
             'min_wall_dist': float(np.min(wall_dist)),
             'min_opponent_dist': float(np.min(opponent_dist)),
+            'min_opponent_longitudinal_rel': float(np.min(long_rel)),
+            'max_abs_opponent_lateral_rel': float(np.max(np.abs(lat_rel))),
             'max_beta': float(np.max(beta)),
             'max_latacc': float(np.max(latacc)),
             'max_abs_steer': float(np.max(steer_abs)),

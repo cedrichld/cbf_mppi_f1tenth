@@ -58,8 +58,12 @@ class MPPI_Node(Node):
         'cost_latacc_sum': '/mppi/debug/cost_latacc_sum',
         'cost_steer_sat_sum': '/mppi/debug/cost_steer_sat_sum',
         'cost_opponent_sum': '/mppi/debug/cost_opponent_sum',
+        'cost_opponent_follow_sum': '/mppi/debug/cost_opponent_follow_sum',
+        'cost_opponent_pass_sum': '/mppi/debug/cost_opponent_pass_sum',
         'min_wall_dist': '/mppi/debug/min_wall_dist',
         'min_opponent_dist': '/mppi/debug/min_opponent_dist',
+        'min_opponent_longitudinal_rel': '/mppi/debug/min_opponent_longitudinal_rel',
+        'max_abs_opponent_lateral_rel': '/mppi/debug/max_abs_opponent_lateral_rel',
         'opponent_path_age': '/mppi/debug/opponent_path_age',
         'opponent_active': '/mppi/debug/opponent_active',
         'max_beta': '/mppi/debug/max_beta',
@@ -248,6 +252,14 @@ class MPPI_Node(Node):
             'opponent_cost_power': 2.0,
             'opponent_cost_discount': 1.0,
             'opponent_path_timeout': 0.5,
+            'opponent_behavior_mode': 'follow',
+            'opponent_behavior_mode_id': 0.0,
+            'opponent_follow_weight': 0.0,
+            'opponent_follow_distance': 1.2,
+            'opponent_same_lane_width': 0.7,
+            'opponent_pass_weight': 0.0,
+            'opponent_pass_lateral_offset': 0.55,
+            'opponent_pass_longitudinal_window': 1.5,
             'slip_cost_enabled': False,
             'slip_cost_weight': 0.0,
             'slip_cost_beta_safe': 0.2,
@@ -309,6 +321,13 @@ class MPPI_Node(Node):
             'opponent_cost_power': float(self.config.opponent_cost_power),
             'opponent_cost_discount': float(self.config.opponent_cost_discount),
             'opponent_path_timeout': float(self.config.opponent_path_timeout),
+            'opponent_behavior_mode': str(self.config.opponent_behavior_mode),
+            'opponent_follow_weight': float(self.config.opponent_follow_weight),
+            'opponent_follow_distance': float(self.config.opponent_follow_distance),
+            'opponent_same_lane_width': float(self.config.opponent_same_lane_width),
+            'opponent_pass_weight': float(self.config.opponent_pass_weight),
+            'opponent_pass_lateral_offset': float(self.config.opponent_pass_lateral_offset),
+            'opponent_pass_longitudinal_window': float(self.config.opponent_pass_longitudinal_window),
             'slip_cost_enabled': bool(self.config.slip_cost_enabled),
             'slip_cost_weight': float(self.config.slip_cost_weight),
             'slip_cost_beta_safe': float(self.config.slip_cost_beta_safe),
@@ -419,6 +438,46 @@ class MPPI_Node(Node):
         self.config.opponent_path_timeout = max(
             0.0,
             float(self.get_parameter('opponent_path_timeout').value),
+        )
+        mode_name = str(self.get_parameter('opponent_behavior_mode').value).strip().lower()
+        mode_map = {
+            'follow': 0.0,
+            'clear': 1.0,
+            'pass_left': 2.0,
+            'left': 2.0,
+            'pass_right': 3.0,
+            'right': 3.0,
+        }
+        if mode_name not in mode_map:
+            self.get_logger().warn(
+                f"Unknown opponent_behavior_mode='{mode_name}', using follow"
+            )
+            mode_name = 'follow'
+        self.config.opponent_behavior_mode = mode_name
+        self.config.opponent_behavior_mode_id = mode_map[mode_name]
+        self.config.opponent_follow_weight = max(
+            0.0,
+            float(self.get_parameter('opponent_follow_weight').value),
+        )
+        self.config.opponent_follow_distance = max(
+            0.0,
+            float(self.get_parameter('opponent_follow_distance').value),
+        )
+        self.config.opponent_same_lane_width = max(
+            0.01,
+            float(self.get_parameter('opponent_same_lane_width').value),
+        )
+        self.config.opponent_pass_weight = max(
+            0.0,
+            float(self.get_parameter('opponent_pass_weight').value),
+        )
+        self.config.opponent_pass_lateral_offset = max(
+            0.0,
+            float(self.get_parameter('opponent_pass_lateral_offset').value),
+        )
+        self.config.opponent_pass_longitudinal_window = max(
+            0.01,
+            float(self.get_parameter('opponent_pass_longitudinal_window').value),
         )
         self.config.slip_cost_enabled = bool(self.get_parameter('slip_cost_enabled').value)
         self.config.slip_cost_weight = max(
@@ -832,6 +891,13 @@ class MPPI_Node(Node):
             self.config.opponent_cost_radius,
             self.config.opponent_cost_power,
             self.config.opponent_cost_discount,
+            self.config.opponent_behavior_mode_id,
+            self.config.opponent_follow_weight,
+            self.config.opponent_follow_distance,
+            self.config.opponent_same_lane_width,
+            self.config.opponent_pass_weight,
+            self.config.opponent_pass_lateral_offset,
+            self.config.opponent_pass_longitudinal_window,
         ], dtype=np.float32)
 
         debug_terms = self.infer_env.reward_debug_terms(

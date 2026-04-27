@@ -96,6 +96,13 @@ class MPPI():
             getattr(self.config, 'opponent_cost_radius', 0.8),
             getattr(self.config, 'opponent_cost_power', 2.0),
             getattr(self.config, 'opponent_cost_discount', 1.0),
+            getattr(self.config, 'opponent_behavior_mode_id', 0.0),
+            getattr(self.config, 'opponent_follow_weight', 0.0),
+            getattr(self.config, 'opponent_follow_distance', 1.2),
+            getattr(self.config, 'opponent_same_lane_width', 0.7),
+            getattr(self.config, 'opponent_pass_weight', 0.0),
+            getattr(self.config, 'opponent_pass_lateral_offset', 0.55),
+            getattr(self.config, 'opponent_pass_longitudinal_window', 1.5),
         ]
         return (
             jnp.asarray(self.config.control_sample_std, dtype=jnp.float32),

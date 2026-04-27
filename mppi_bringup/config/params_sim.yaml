@@ -35,7 +35,7 @@ lmppi_node:
     # Feedforward from raceline vx_mps to /drive.speed. MPPI still
     # supplies steering and can still pull speed through the blend term when
     # blend is below 1.0 (1.0 is much better in sim)
-    use_speed_profile_drive_speed: true      # true: blend profile speed into final /drive.speed command.
+    use_speed_profile_drive_speed: false      # true: blend profile speed into final /drive.speed command.
     speed_profile_drive_blend: 1.0           # 0 = pure MPPI accel command; 1 = pure raceline/profile speed command.
     speed_profile_drive_lookahead_steps: 3   # Command brake lookahead: which future ref speed drives /drive.speed.
     speed_profile_drive_use_min_lookahead: true # true: use min speed through lookahead to avoid early exit accel.
@@ -74,6 +74,13 @@ lmppi_node:
     opponent_cost_power: 2.0
     opponent_cost_discount: 1.0
     opponent_path_timeout: 0.5
+    opponent_behavior_mode: follow       # follow, clear, pass_left, pass_right.
+    opponent_follow_weight: 8.0          # In follow mode, penalizes closing too near behind the opponent.
+    opponent_follow_distance: 1.2        # Desired gap behind opponent along the raceline tangent.
+    opponent_same_lane_width: 0.7        # Follow gap only applies when ego is roughly in same lane.
+    opponent_pass_weight: 12.0           # In pass modes, pushes rollout to requested side near opponent.
+    opponent_pass_lateral_offset: 0.55   # Desired lateral offset from opponent during a pass.
+    opponent_pass_longitudinal_window: 1.5 # Longitudinal window around opponent where pass-side cost applies.
 
     slip_cost_enabled: true
     slip_cost_weight: 5.0
