@@ -74,13 +74,19 @@ lmppi_node:
     opponent_cost_power: 2.0
     opponent_cost_discount: 1.0
     opponent_path_timeout: 0.5
-    opponent_behavior_mode: clear       # follow, clear, pass_left, pass_right.
+    opponent_behavior_mode: auto        # auto, follow, clear, pass_left, pass_right.
     opponent_follow_weight: 8.0          # In follow mode, penalizes closing too near behind the opponent.
     opponent_follow_distance: 1.2        # Desired gap behind opponent along the raceline tangent.
     opponent_same_lane_width: 0.7        # Follow gap only applies when ego is roughly in same lane.
     opponent_pass_weight: 12.0           # In pass modes, pushes rollout to requested side near opponent.
     opponent_pass_lateral_offset: 0.55   # Desired lateral offset from opponent during a pass.
     opponent_pass_longitudinal_window: 1.5 # Longitudinal window around opponent where pass-side cost applies.
+    opponent_auto_wall_check_enabled: true
+    opponent_auto_min_wall_clearance: 0.45 # Required wall clearance at candidate pass-side points.
+    opponent_auto_check_steps: 3          # How many opponent horizon points to check for pass clearance.
+    opponent_auto_min_closing_speed: 0.4  # Required desired ego speed minus opponent speed before passing.
+    opponent_auto_max_ahead_distance: 4.0 # Only consider passing opponents this far ahead along reference tangent.
+    opponent_auto_side_switch_margin: 0.08 # Extra clearance needed to prefer left over right when both are open.
 
     slip_cost_enabled: true
     slip_cost_weight: 5.0
