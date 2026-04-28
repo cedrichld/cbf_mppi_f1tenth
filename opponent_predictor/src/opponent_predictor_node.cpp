@@ -141,15 +141,18 @@ public:
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
+    const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(1);
+    const auto debug_qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
+
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       input_odom_topic_,
-      rclcpp::QoS(10),
+      sensor_qos,
       std::bind(&OpponentPredictorNode::odomCallback, this, std::placeholders::_1));
 
-    estimated_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(estimated_odom_topic_, 10);
-    predicted_path_pub_ = create_publisher<nav_msgs::msg::Path>(predicted_path_topic_, 10);
-    marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(marker_topic_, 10);
-    debug_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>(debug_topic_, 10);
+    estimated_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(estimated_odom_topic_, sensor_qos);
+    predicted_path_pub_ = create_publisher<nav_msgs::msg::Path>(predicted_path_topic_, sensor_qos);
+    marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(marker_topic_, debug_qos);
+    debug_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>(debug_topic_, debug_qos);
 
     timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / publish_rate_hz_),

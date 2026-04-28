@@ -123,19 +123,22 @@ public:
     refreshLiveParams();
     loadWaypoints(resolveWaypointPath(waypoint_path_, waypoint_path_absolute_));
 
+    const auto sensor_qos = rclcpp::SensorDataQoS().keep_last(1);
+    const auto debug_qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
+
     scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
-      scan_topic_, rclcpp::SensorDataQoS(),
+      scan_topic_, sensor_qos,
       std::bind(&OpponentLidarDetectorNode::scanCallback, this, std::placeholders::_1));
     ego_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      ego_odom_topic_, 10,
+      ego_odom_topic_, sensor_qos,
       std::bind(&OpponentLidarDetectorNode::egoOdomCallback, this, std::placeholders::_1));
     map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       map_topic_, rclcpp::QoS(1).transient_local().reliable(),
       std::bind(&OpponentLidarDetectorNode::mapCallback, this, std::placeholders::_1));
 
-    detection_pub_ = create_publisher<nav_msgs::msg::Odometry>(detected_odom_topic_, 10);
-    marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(detector_marker_topic_, 10);
-    debug_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>(detector_debug_topic_, 10);
+    detection_pub_ = create_publisher<nav_msgs::msg::Odometry>(detected_odom_topic_, sensor_qos);
+    marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(detector_marker_topic_, debug_qos);
+    debug_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>(detector_debug_topic_, debug_qos);
 
     RCLCPP_INFO(
       get_logger(),

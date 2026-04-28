@@ -142,31 +142,45 @@ class MPPI_Node(Node):
         }
 
         
-        qos = rclpy.qos.QoSProfile(history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST,
-                                   depth=1,
-                                   reliability=rclpy.qos.QoSReliabilityPolicy.RELIABLE,
-                                   durability=rclpy.qos.QoSDurabilityPolicy.VOLATILE)
+        qos = rclpy.qos.QoSProfile(
+            history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=rclpy.qos.QoSReliabilityPolicy.RELIABLE,
+            durability=rclpy.qos.QoSDurabilityPolicy.VOLATILE,
+        )
+        sensor_qos = rclpy.qos.QoSProfile(
+            history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=rclpy.qos.QoSReliabilityPolicy.BEST_EFFORT,
+            durability=rclpy.qos.QoSDurabilityPolicy.VOLATILE,
+        )
+        debug_qos = rclpy.qos.QoSProfile(
+            history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=rclpy.qos.QoSReliabilityPolicy.BEST_EFFORT,
+            durability=rclpy.qos.QoSDurabilityPolicy.VOLATILE,
+        )
         # create subscribers
         if self.config.is_sim:
-            self.pose_sub = self.create_subscription(Odometry, "/ego_racecar/odom", self.pose_callback, qos)
+            self.pose_sub = self.create_subscription(Odometry, "/ego_racecar/odom", self.pose_callback, sensor_qos)
         else:
-            self.pose_sub = self.create_subscription(Odometry, "/pf/pose/odom", self.pose_callback, qos)
+            self.pose_sub = self.create_subscription(Odometry, "/pf/pose/odom", self.pose_callback, sensor_qos)
         self.opponent_path_sub = self.create_subscription(
             NavPath,
             self.config.opponent_path_topic,
             self.opponent_path_callback,
-            qos,
+            sensor_qos,
         )
         # publishers
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", qos)
-        self.reference_pub = self.create_publisher(Float32MultiArray, "/reference_arr", qos)
-        self.opt_traj_pub = self.create_publisher(Float32MultiArray, "/opt_traj_arr", qos)
-        self.reference_marker_pub = self.create_publisher(MarkerArray, "/mppi/reference", qos)
-        self.opt_traj_marker_pub = self.create_publisher(MarkerArray, "/mppi/optimal_trajectory", qos)
-        self.sampled_traj_marker_pub = self.create_publisher(MarkerArray, "/mppi/sampled_trajectories", qos)
-        self.speed_debug_pub = self.create_publisher(Float32MultiArray, "/mppi/speed_debug", qos)
+        self.reference_pub = self.create_publisher(Float32MultiArray, "/reference_arr", debug_qos)
+        self.opt_traj_pub = self.create_publisher(Float32MultiArray, "/opt_traj_arr", debug_qos)
+        self.reference_marker_pub = self.create_publisher(MarkerArray, "/mppi/reference", debug_qos)
+        self.opt_traj_marker_pub = self.create_publisher(MarkerArray, "/mppi/optimal_trajectory", debug_qos)
+        self.sampled_traj_marker_pub = self.create_publisher(MarkerArray, "/mppi/sampled_trajectories", debug_qos)
+        self.speed_debug_pub = self.create_publisher(Float32MultiArray, "/mppi/speed_debug", debug_qos)
         self.reward_debug_pubs = {
-            key: self.create_publisher(Float32, topic, qos)
+            key: self.create_publisher(Float32, topic, debug_qos)
             for key, topic in self.DEBUG_SCALAR_TOPICS.items()
         }
 
@@ -833,9 +847,14 @@ class MPPI_Node(Node):
     def stamp_to_sec(stamp):
         return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
+    def now_sec(self):
+        return float(self.get_clock().now().nanoseconds) * 1e-9
+
     def opponent_path_callback(self, msg):
         poses = list(msg.poses)
         if not poses:
+            self.opponent_path_time = None
+            self.opponent_xy_horizon = np.zeros((self.config.n_steps, 2), dtype=np.float32)
             return
 
         start_idx = 1 if len(poses) > 1 else 0
@@ -855,7 +874,7 @@ class MPPI_Node(Node):
             horizon = np.vstack([horizon, pad])
 
         self.opponent_xy_horizon = horizon[:self.config.n_steps]
-        self.opponent_path_time = time.time()
+        self.opponent_path_time = self.now_sec()
 
     def get_opponent_horizon(self):
         horizon = np.asarray(self.opponent_xy_horizon, dtype=np.float32)
@@ -870,7 +889,7 @@ class MPPI_Node(Node):
         if self.opponent_path_time is None:
             return horizon, False, np.inf
 
-        age = time.time() - self.opponent_path_time
+        age = self.now_sec() - self.opponent_path_time
         active = (
             self.config.opponent_cost_enabled
             and age <= self.config.opponent_path_timeout
@@ -1337,7 +1356,35 @@ class MPPI_Node(Node):
             self.config.min_speed,
             self.config.max_speed,
         ))
-        
+
+        if vx_state < self.config.init_vel:
+            startup_speed = np.clip(
+                self.config.startup_speed,
+                self.config.min_speed,
+                self.config.max_speed,
+            )
+            self.control[1] = float(max(self.control[1], startup_speed))
+
+        if np.isnan(self.control).any() or np.isinf(self.control).any():
+            self.control = np.array([0.0, 0.0])
+            self.mppi.a_opt = np.zeros_like(self.mppi.a_opt)
+
+        # Publish the safety-critical control command before any optional
+        # debug/visualization work. MarkerArray and rosbag serialization can
+        # add large timing spikes on hardware; they should never sit between
+        # a solved control and /drive.
+        drive_msg = AckermannDriveStamped()
+        drive_msg.header.stamp = self.get_clock().now().to_msg()
+        drive_msg.header.frame_id = "base_link"
+        drive_msg.drive.steering_angle = self.control[0]
+        drive_msg.drive.speed = self.control[1]
+        self.drive_pub.publish(drive_msg)
+        self.hz.append(1/(time.time() - t1))
+        if len(self.hz) == 100:
+            self.hz = np.mean(self.hz)
+            print(f"MPPI Hz: {self.hz:.2f}")
+            self.hz = []
+
         if self.reference_pub.get_subscription_count() > 0:
             ref_traj_cpu = numpify(reference_traj)
             arr_msg = to_multiarray_f32(ref_traj_cpu.astype(np.float32))
@@ -1351,14 +1398,6 @@ class MPPI_Node(Node):
         self.publish_reward_debug(reference_traj, opponent_traj, opponent_active, opponent_age)
         self.publish_visualization(reference_traj)
 
-        if vx_state < self.config.init_vel:
-            startup_speed = np.clip(
-                self.config.startup_speed,
-                self.config.min_speed,
-                self.config.max_speed,
-            )
-            self.control[1] = float(max(self.control[1], startup_speed))
-
         if self.speed_debug_pub.get_subscription_count() > 0:
             speed_debug = np.array([
                 vx_state,
@@ -1368,24 +1407,6 @@ class MPPI_Node(Node):
                 self.config.speed_profile_drive_blend,
             ], dtype=np.float32)
             self.speed_debug_pub.publish(to_multiarray_f32(speed_debug))
-
-        if np.isnan(self.control).any() or np.isinf(self.control).any():
-            self.control = np.array([0.0, 0.0])
-            self.mppi.a_opt = np.zeros_like(self.mppi.a_opt)
-
-        # Publish the control command
-        drive_msg = AckermannDriveStamped()
-        drive_msg.header.stamp = self.get_clock().now().to_msg()
-        drive_msg.header.frame_id = "base_link"
-        drive_msg.drive.steering_angle = self.control[0]
-        drive_msg.drive.speed = self.control[1]
-        # self.get_logger().info(f"Steering Angle: {drive_msg.drive.steering_angle}, Speed: {drive_msg.drive.speed}")
-        self.drive_pub.publish(drive_msg)
-        self.hz.append(1/(time.time() - t1))
-        if len(self.hz) == 100:
-            self.hz = np.mean(self.hz)
-            print(f"MPPI Hz: {self.hz:.2f}")
-            self.hz = []
         
 
 def main(args=None):
