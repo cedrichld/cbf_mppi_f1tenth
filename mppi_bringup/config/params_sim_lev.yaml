@@ -105,9 +105,18 @@ lmppi_node:
     # leave the optimizer biased, reset the shifted control sequence instead
     # of carrying that bad plan for many future callbacks.
     mppi_guard_on_timing_jump: true
-    mppi_guard_wall_gap: 0.25
-    mppi_guard_stamp_gap: 0.25
+    mppi_guard_wall_gap: 0.12
+    mppi_guard_stamp_gap: 0.12
     mppi_guard_aopt_threshold: 0.98
+    mppi_guard_saturation_callbacks: 4
+    mppi_guard_bad_callbacks_to_clear_control: 3
+
+    # Pose-delta estimator persistence. Mostly relevant on hardware, but kept
+    # here so the same params exist when switching configs.
+    state_est_vy_prior: 0.4
+    state_est_wz_prior: 0.4
+    state_est_hiccup_dt: 0.06
+    state_est_hiccup_prior_scale: 0.35
 
 
     ######################################################

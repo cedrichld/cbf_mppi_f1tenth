@@ -9,7 +9,7 @@ lmppi_node:
     n_steps: 10 #try lower                   # Rollout horizon length. At dt=0.1, 12 steps = 1.2s lookahead.
     sim_time_step: 0.1            # Rollout integration/control timestep used inside MPPI.
     random_seed: 527787           # Sampling seed. Keep fixed for repeatable tuning runs.
-    render: true                  # true keeps optimal/sampled rollouts available for visualization.
+    render: false                 # Race hardware: avoid extra rollout/sync unless debugging trajectories.
 
     # Live tuning parameters: mppi_node.get_params() refreshes these on every
     # odometry callback, so they can be changed with ros2 param set.
@@ -105,9 +105,18 @@ lmppi_node:
     # leave the optimizer biased, reset the shifted control sequence instead
     # of carrying that bad plan for many future callbacks.
     mppi_guard_on_timing_jump: true
-    mppi_guard_wall_gap: 0.25
-    mppi_guard_stamp_gap: 0.25
+    mppi_guard_wall_gap: 0.12
+    mppi_guard_stamp_gap: 0.12
     mppi_guard_aopt_threshold: 0.98
+    mppi_guard_saturation_callbacks: 4
+    mppi_guard_bad_callbacks_to_clear_control: 3
+
+    # Pose-delta estimator persistence. Lower prior weights forget a bad
+    # vy/wz sample faster; hiccup settings reduce memory after odom dt spikes.
+    state_est_vy_prior: 0.4
+    state_est_wz_prior: 0.4
+    state_est_hiccup_dt: 0.06
+    state_est_hiccup_prior_scale: 0.35
 
 
     ######################################################

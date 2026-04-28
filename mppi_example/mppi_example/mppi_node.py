@@ -74,8 +74,13 @@ class MPPI_Node(Node):
         'opponent_active': '/mppi/debug/opponent_active',
         'callback_wall_dt': '/mppi/debug/callback_wall_dt',
         'callback_stamp_dt': '/mppi/debug/callback_stamp_dt',
+        'prev_pose_dt': '/mppi/debug/prev_pose_dt',
+        'state_est_vy': '/mppi/debug/state_est_vy',
+        'state_est_wz': '/mppi/debug/state_est_wz',
         'mppi_solve_time': '/mppi/debug/mppi_solve_time',
         'mppi_aopt_max_abs': '/mppi/debug/mppi_aopt_max_abs',
+        'mppi_saturation_count': '/mppi/debug/mppi_saturation_count',
+        'mppi_bad_output_count': '/mppi/debug/mppi_bad_output_count',
         'mppi_guard_count': '/mppi/debug/mppi_guard_count',
         'max_beta': '/mppi/debug/max_beta',
         'max_latacc': '/mppi/debug/max_latacc',
@@ -134,9 +139,14 @@ class MPPI_Node(Node):
         self.last_pose_callback_wall_time = None
         self.last_pose_msg_time = None
         self.mppi_guard_count = 0
+        self.mppi_saturation_count = 0
+        self.mppi_bad_output_count = 0
         self.last_timing_debug = {
             'callback_wall_dt': 0.0,
             'callback_stamp_dt': 0.0,
+            'prev_pose_dt': 0.0,
+            'state_est_vy': 0.0,
+            'state_est_wz': 0.0,
             'mppi_solve_time': 0.0,
             'mppi_aopt_max_abs': 0.0,
         }
@@ -320,6 +330,12 @@ class MPPI_Node(Node):
             'mppi_guard_wall_gap': 0.25,
             'mppi_guard_stamp_gap': 0.25,
             'mppi_guard_aopt_threshold': 0.98,
+            'mppi_guard_saturation_callbacks': 4,
+            'mppi_guard_bad_callbacks_to_clear_control': 3,
+            'state_est_vy_prior': 0.40,
+            'state_est_wz_prior': 0.40,
+            'state_est_hiccup_dt': 0.06,
+            'state_est_hiccup_prior_scale': 0.35,
 
         }
         for key, value in defaults.items():
@@ -593,6 +609,19 @@ class MPPI_Node(Node):
               fdesc('Odom stamp gap that clears persistent MPPI/control state.', 0.05, 2.0, 0.01))
         declf('mppi_guard_aopt_threshold', self.config.mppi_guard_aopt_threshold,
               fdesc('Clear warm-start if first-action components remain near saturation.', 0.5, 1.0, 0.01))
+        decli('mppi_guard_saturation_callbacks', self.config.mppi_guard_saturation_callbacks,
+              idesc('Consecutive saturated MPPI callbacks before clearing warm-start.', 1, 20))
+        decli('mppi_guard_bad_callbacks_to_clear_control',
+              self.config.mppi_guard_bad_callbacks_to_clear_control,
+              idesc('Consecutive bad callbacks before falling back to startup speed.', 1, 10))
+        declf('state_est_vy_prior', self.config.state_est_vy_prior,
+              fdesc('Pose-delta vy IIR prior weight. Lower forgets bad samples faster.', 0.0, 0.95, 0.01))
+        declf('state_est_wz_prior', self.config.state_est_wz_prior,
+              fdesc('Pose-delta wz IIR prior weight. Lower forgets bad samples faster.', 0.0, 0.95, 0.01))
+        declf('state_est_hiccup_dt', self.config.state_est_hiccup_dt,
+              fdesc('Odom dt above this reduces vy/wz prior weights.', 0.0, 0.5, 0.005))
+        declf('state_est_hiccup_prior_scale', self.config.state_est_hiccup_prior_scale,
+              fdesc('Multiplier on vy/wz prior weights after an odom timing hiccup.', 0.0, 1.0, 0.01))
 
     def get_params(self, startup=False):
         if startup:
@@ -850,6 +879,33 @@ class MPPI_Node(Node):
             0.0,
             1.0,
         ))
+        self.config.mppi_guard_saturation_callbacks = max(
+            1,
+            int(self.get_parameter('mppi_guard_saturation_callbacks').value),
+        )
+        self.config.mppi_guard_bad_callbacks_to_clear_control = max(
+            1,
+            int(self.get_parameter('mppi_guard_bad_callbacks_to_clear_control').value),
+        )
+        self.config.state_est_vy_prior = float(np.clip(
+            float(self.get_parameter('state_est_vy_prior').value),
+            0.0,
+            0.95,
+        ))
+        self.config.state_est_wz_prior = float(np.clip(
+            float(self.get_parameter('state_est_wz_prior').value),
+            0.0,
+            0.95,
+        ))
+        self.config.state_est_hiccup_dt = max(
+            0.0,
+            float(self.get_parameter('state_est_hiccup_dt').value),
+        )
+        self.config.state_est_hiccup_prior_scale = float(np.clip(
+            float(self.get_parameter('state_est_hiccup_prior_scale').value),
+            0.0,
+            1.0,
+        ))
 
         if hasattr(self, 'infer_env'):
             self.infer_env.config = self.config
@@ -1065,6 +1121,17 @@ class MPPI_Node(Node):
         self.mppi_guard_count += 1
         self.get_logger().warn(f"Cleared MPPI persistent state ({self.mppi_guard_count}): {reason}")
 
+    def handle_bad_callback(self, reason):
+        self.mppi_bad_output_count += 1
+        clear_control = (
+            self.mppi_bad_output_count >= self.config.mppi_guard_bad_callbacks_to_clear_control
+        )
+        self.clear_persistent_mppi_state(reason, clear_control=clear_control)
+        if clear_control:
+            self.get_logger().error(
+                f"Falling back to startup command after {self.mppi_bad_output_count} bad callbacks."
+            )
+
     def maybe_guard_for_timing(self, wall_dt, stamp_dt):
         if not getattr(self.config, 'mppi_guard_on_timing_jump', True):
             return
@@ -1113,6 +1180,9 @@ class MPPI_Node(Node):
             self.state_est_vx = seed_speed
             self.state_est_vy = raw_vy
             self.state_est_wz = raw_wz
+            self.last_timing_debug['prev_pose_dt'] = 0.0
+            self.last_timing_debug['state_est_vy'] = raw_vy
+            self.last_timing_debug['state_est_wz'] = raw_wz
             return seed_speed, raw_vy, raw_wz, np.arctan2(raw_vy, max(seed_speed, 1e-6))
 
         dt = callback_time - self.prev_pose_time
@@ -1120,6 +1190,7 @@ class MPPI_Node(Node):
             self.prev_pose_time = callback_time
             self.prev_pose_xy = pose_xy
             self.prev_pose_yaw = theta
+            self.last_timing_debug['prev_pose_dt'] = float(dt) if np.isfinite(dt) else -1.0
             fallback_vx = max(
                 raw_vx,
                 commanded_speed,
@@ -1132,6 +1203,7 @@ class MPPI_Node(Node):
                 max(abs(fallback_vx), 1e-6),
             )
 
+        self.last_timing_debug['prev_pose_dt'] = float(dt)
         world_vel = (pose_xy - self.prev_pose_xy) / dt
         cos_th = np.cos(theta)
         sin_th = np.sin(theta)
@@ -1152,12 +1224,19 @@ class MPPI_Node(Node):
         vx_est = float(np.clip(vx_est, self.config.min_speed, self.config.max_speed))
         vx_est = max(vx_est, self.config.init_vel)
 
+        prior_scale = 1.0
+        if self.config.state_est_hiccup_dt > 0.0 and dt > self.config.state_est_hiccup_dt:
+            prior_scale = self.config.state_est_hiccup_prior_scale
+
+        vy_prior = float(np.clip(self.config.state_est_vy_prior * prior_scale, 0.0, 0.95))
+        wz_prior = float(np.clip(self.config.state_est_wz_prior * prior_scale, 0.0, 0.95))
+
         vy_obs = 0.8 * vy_pose + 0.2 * raw_vy
-        vy_est = 0.35 * vy_obs + 0.65 * self.state_est_vy
+        vy_est = (1.0 - vy_prior) * vy_obs + vy_prior * self.state_est_vy
         vy_est = float(np.clip(vy_est, -2.0, 2.0))
 
         wz_obs = 0.85 * wz_pose + 0.15 * raw_wz
-        wz_est = 0.45 * wz_obs + 0.55 * self.state_est_wz
+        wz_est = (1.0 - wz_prior) * wz_obs + wz_prior * self.state_est_wz
         wz_est = float(np.clip(wz_est, -6.0, 6.0))
 
         self.prev_pose_time = callback_time
@@ -1166,6 +1245,8 @@ class MPPI_Node(Node):
         self.state_est_vx = vx_est
         self.state_est_vy = vy_est
         self.state_est_wz = wz_est
+        self.last_timing_debug['state_est_vy'] = vy_est
+        self.last_timing_debug['state_est_wz'] = wz_est
 
         beta_est = np.arctan2(vy_est, max(abs(vx_est), 1e-6))
         return vx_est, vy_est, wz_est, beta_est
@@ -1331,8 +1412,13 @@ class MPPI_Node(Node):
         debug_terms['opponent_auto_pass_allowed'] = self.opponent_auto_debug.get('pass_allowed', 0.0)
         debug_terms['callback_wall_dt'] = self.last_timing_debug.get('callback_wall_dt', 0.0)
         debug_terms['callback_stamp_dt'] = self.last_timing_debug.get('callback_stamp_dt', 0.0)
+        debug_terms['prev_pose_dt'] = self.last_timing_debug.get('prev_pose_dt', 0.0)
+        debug_terms['state_est_vy'] = self.last_timing_debug.get('state_est_vy', 0.0)
+        debug_terms['state_est_wz'] = self.last_timing_debug.get('state_est_wz', 0.0)
         debug_terms['mppi_solve_time'] = self.last_timing_debug.get('mppi_solve_time', 0.0)
         debug_terms['mppi_aopt_max_abs'] = self.last_timing_debug.get('mppi_aopt_max_abs', 0.0)
+        debug_terms['mppi_saturation_count'] = float(self.mppi_saturation_count)
+        debug_terms['mppi_bad_output_count'] = float(self.mppi_bad_output_count)
         debug_terms['mppi_guard_count'] = float(self.mppi_guard_count)
 
         for key, pub in self.reward_debug_pubs.items():
@@ -1370,7 +1456,7 @@ class MPPI_Node(Node):
             twist.angular.z,
         ], dtype=float)
         if not np.isfinite(pose_values).all():
-            self.clear_persistent_mppi_state("non-finite odom input", clear_control=True)
+            self.handle_bad_callback("non-finite odom input")
             return
         wall_dt = 0.0 if self.last_pose_callback_wall_time is None else t1 - self.last_pose_callback_wall_time
         stamp_dt = 0.0 if self.last_pose_msg_time is None else callback_time - self.last_pose_msg_time
@@ -1397,13 +1483,13 @@ class MPPI_Node(Node):
             beta,
         ])
         if not np.isfinite(state_c_0).all():
-            self.clear_persistent_mppi_state("non-finite estimated state", clear_control=True)
+            self.handle_bad_callback("non-finite estimated state")
             return
         find_waypoint_vel = max(self.config.ref_vel, vx_state)
         
         reference_traj, waypoint_ind = self.infer_env.get_refernece_traj(state_c_0, find_waypoint_vel, self.config.n_steps)
         if not np.isfinite(reference_traj).all():
-            self.clear_persistent_mppi_state("non-finite reference trajectory", clear_control=True)
+            self.handle_bad_callback("non-finite reference trajectory")
             return
         opponent_traj, opponent_active, opponent_age = self.get_opponent_horizon()
         if not self.sanitize_opponent_horizon():
@@ -1425,21 +1511,32 @@ class MPPI_Node(Node):
         if not np.isfinite(aopt_max_abs):
             aopt_max_abs = float('inf')
         self.last_timing_debug['mppi_aopt_max_abs'] = aopt_max_abs
+        bad_mppi_output = False
         if (
             not np.isfinite(a_opt_cpu).all()
             or not np.isfinite(numpify(self.mppi.traj_opt)).all()
         ):
-            self.clear_persistent_mppi_state("non-finite MPPI output", clear_control=True)
+            bad_mppi_output = True
+            self.handle_bad_callback("non-finite MPPI output")
             a_opt_cpu = np.asarray(numpify(self.mppi.a_opt))
-            self.control = np.array([0.0, max(self.config.startup_speed, self.config.min_speed)])
         elif aopt_max_abs >= self.config.mppi_guard_aopt_threshold:
             saturated_frac = float(np.mean(np.abs(a_opt_cpu[:min(3, a_opt_cpu.shape[0]), :]) >= self.config.mppi_guard_aopt_threshold))
             if saturated_frac > 0.8:
-                self.clear_persistent_mppi_state(
-                    f"warm start saturation max={aopt_max_abs:.3f} frac={saturated_frac:.2f}",
-                    reset_state_estimator=False,
-                )
-                a_opt_cpu = np.asarray(numpify(self.mppi.a_opt))
+                self.mppi_saturation_count += 1
+                if self.mppi_saturation_count >= self.config.mppi_guard_saturation_callbacks:
+                    self.clear_persistent_mppi_state(
+                        f"warm start saturation max={aopt_max_abs:.3f} frac={saturated_frac:.2f}",
+                        reset_state_estimator=False,
+                    )
+                    self.mppi_saturation_count = 0
+                    a_opt_cpu = np.asarray(numpify(self.mppi.a_opt))
+            else:
+                self.mppi_saturation_count = 0
+        else:
+            self.mppi_saturation_count = 0
+
+        if not bad_mppi_output and np.isfinite(a_opt_cpu).all():
+            self.mppi_bad_output_count = 0
 
         mppi_control = a_opt_cpu[0] * self.config.norm_params[0, :2]/2
         prev_speed_command = float(self.control[1])
