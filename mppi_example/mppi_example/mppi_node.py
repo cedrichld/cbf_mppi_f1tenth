@@ -335,17 +335,17 @@ class MPPI_Node(Node):
         accel_scale = float(self.config.norm_params[0, 1] / 2.0)
         random_seed = -1 if self.config.random_seed is None else int(self.config.random_seed)
 
-        # ---- Startup-only (read at init; require restart to change) ----
+        # Order below intentionally mirrors params_realev_overtake.yaml so rqt
+        # displays params in the same order as the YAML reads (rclpy preserves
+        # insertion order, and rqt iterates that for layout).
+
+        # ---- Startup (read once; restart to change) ----
         declb('is_sim', self.config.is_sim,
               desc('[startup] true: /ego_racecar/odom; false: /pf/pose/odom.', read_only=True))
         declb('wpt_path_absolute', self.config.wpt_path_absolute,
               desc('[startup] Use wpt_path as absolute path to raceline CSV.', read_only=True))
         decls('wpt_path', self.config.wpt_path,
               desc('[startup] Absolute path to MPPI raceline CSV.', read_only=True))
-        decls('wall_cost_map_yaml', self.config.wall_cost_map_yaml,
-              desc('[startup] Map YAML for wall SDF (injected by launch).', read_only=True))
-        decls('opponent_path_topic', self.config.opponent_path_topic,
-              desc('[startup] Topic publishing opponent predicted Path.', read_only=True))
         decls('map_dir', self.config.map_dir,
               desc('[startup] Directory containing map_info.txt and raceline csv.', read_only=True))
         decli('map_ind', self.config.map_ind,
@@ -368,7 +368,7 @@ class MPPI_Node(Node):
               desc('[startup] Keep optimal/sampled rollouts available for visualization.',
                    read_only=True))
 
-        # ---- MPPI core ----
+        # ---- Live tuning ----
         declf('temperature', self.config.temperature,
               fdesc('MPPI greediness. Lower=winner-take-all; higher=smoother averaging.',
                     0.001, 1.0, 0.001))
@@ -392,7 +392,37 @@ class MPPI_Node(Node):
         decli('n_iterations', self.config.n_iterations,
               idesc('MPPI update passes per odom callback.', 1, 10))
 
-        # ---- Sampling / control scaling ----
+        # ---- Speed profile (rollout reference) ----
+        declb('use_waypoint_speed_profile', self.config.use_waypoint_speed_profile,
+              desc('Use raceline vx_mps as MPPI reference speed.'))
+        declf('speed_profile_scale', self.config.speed_profile_scale,
+              fdesc('Multiplies raceline vx_mps. Raise to push pace.',
+                    0.0, 3.0, 0.01))
+        declf('speed_profile_min_speed', self.config.speed_profile_min_speed,
+              fdesc('Lower clamp for profile speed (m/s).', 0.0, 20.0, 0.1))
+        declf('speed_profile_max_speed', self.config.speed_profile_max_speed,
+              fdesc('Upper clamp for profile speed (m/s).', 0.0, 25.0, 0.1))
+        decli('speed_profile_lookahead_steps', self.config.speed_profile_lookahead_steps,
+              idesc('Planning brake lookahead (steps).', 0, 20))
+        decli('speed_profile_iterations', self.config.speed_profile_iterations,
+              idesc('Profile rebuild passes per call.', 1, 10))
+
+        # ---- Speed profile (drive feedforward) ----
+        declb('use_speed_profile_drive_speed', self.config.use_speed_profile_drive_speed,
+              desc('Blend profile speed into final /drive.speed command.'))
+        declf('speed_profile_drive_blend', self.config.speed_profile_drive_blend,
+              fdesc('0 = pure MPPI accel; 1 = pure profile speed.', 0.0, 1.0, 0.01))
+        decli('speed_profile_drive_lookahead_steps', self.config.speed_profile_drive_lookahead_steps,
+              idesc('Command brake lookahead (future ref step).', 0, 20))
+        declb('speed_profile_drive_use_min_lookahead',
+              self.config.speed_profile_drive_use_min_lookahead,
+              desc('Use min speed through lookahead window.'))
+        declf('speed_profile_drive_max_accel', self.config.speed_profile_drive_max_accel,
+              fdesc('Max commanded speed increase rate (m/s^2).', 0.0, 30.0, 0.1))
+        declf('speed_profile_drive_max_decel', self.config.speed_profile_drive_max_decel,
+              fdesc('Max commanded speed decrease rate (m/s^2).', 0.0, 30.0, 0.1))
+
+        # ---- Control sampling ----
         declf('control_sample_std_steer', self.config.control_sample_std[0],
               fdesc('Std of normalized steering-rate noise. Higher = sharper exploration.',
                     0.0, 2.0, 0.01))
@@ -424,8 +454,12 @@ class MPPI_Node(Node):
               fdesc('Distance below which wall cost activates (m).', 0.0, 1.5, 0.01))
         declf('wall_cost_power', self.config.wall_cost_power,
               fdesc('Wall cost exponent.', 1.0, 5.0, 0.1))
+        decls('wall_cost_map_yaml', self.config.wall_cost_map_yaml,
+              desc('[startup] Map YAML for wall SDF (injected by launch).', read_only=True))
 
         # ---- Opponent cost ----
+        decls('opponent_path_topic', self.config.opponent_path_topic,
+              desc('[startup] Topic publishing opponent predicted Path.', read_only=True))
         declb('opponent_cost_enabled', self.config.opponent_cost_enabled,
               desc('Enable opponent-aware MPPI cost.'))
         declf('opponent_cost_weight', self.config.opponent_cost_weight,
@@ -453,11 +487,6 @@ class MPPI_Node(Node):
         declf('opponent_pass_lateral_offset', self.config.opponent_pass_lateral_offset,
               fdesc('Desired lateral offset from opponent during pass (m).',
                     0.0, 2.0, 0.05))
-        declf('opponent_pass_longitudinal_window', self.config.opponent_pass_longitudinal_window,
-              fdesc('Longitudinal window where pass-side cost applies (m).',
-                    0.05, 5.0, 0.05))
-
-        # ---- Auto-mode opponent decisions ----
         declb('opponent_auto_wall_check_enabled', self.config.opponent_auto_wall_check_enabled,
               desc('Auto mode: check wall clearance before passing.'))
         declf('opponent_auto_min_wall_clearance', self.config.opponent_auto_min_wall_clearance,
@@ -473,8 +502,11 @@ class MPPI_Node(Node):
         declf('opponent_auto_side_switch_margin', self.config.opponent_auto_side_switch_margin,
               fdesc('Hysteresis: extra clearance needed to flip preferred pass side (m).',
                     0.0, 1.0, 0.01))
+        declf('opponent_pass_longitudinal_window', self.config.opponent_pass_longitudinal_window,
+              fdesc('Longitudinal window where pass-side cost applies (m).',
+                    0.05, 5.0, 0.05))
 
-        # ---- Slip / lat-acc / steer saturation costs ----
+        # ---- Slip cost ----
         declb('slip_cost_enabled', self.config.slip_cost_enabled,
               desc('Enable side-slip cost.'))
         declf('slip_cost_weight', self.config.slip_cost_weight,
@@ -482,6 +514,7 @@ class MPPI_Node(Node):
         declf('slip_cost_beta_safe', self.config.slip_cost_beta_safe,
               fdesc('Safe slip-angle threshold (rad).', 0.0, 1.5, 0.01))
 
+        # ---- Lat-acc cost ----
         declb('latacc_cost_enabled', self.config.latacc_cost_enabled,
               desc('Enable lateral acceleration cost.'))
         declf('latacc_cost_weight', self.config.latacc_cost_weight,
@@ -489,42 +522,13 @@ class MPPI_Node(Node):
         declf('latacc_cost_safe', self.config.latacc_cost_safe,
               fdesc('Lat-acc safe threshold (m/s^2).', 0.0, 100.0, 0.5))
 
+        # ---- Steer-saturation cost ----
         declb('steer_sat_cost_enabled', self.config.steer_sat_cost_enabled,
               desc('Enable steering-saturation cost.'))
         declf('steer_sat_cost_weight', self.config.steer_sat_cost_weight,
               fdesc('Steering saturation cost weight.', 0.0, 10.0, 0.05))
         declf('steer_sat_soft_ratio', self.config.steer_sat_soft_ratio,
               fdesc('Soft limit as fraction of max steering.', 0.0, 1.0, 0.01))
-
-        # ---- Speed profile (rollout reference) ----
-        declb('use_waypoint_speed_profile', self.config.use_waypoint_speed_profile,
-              desc('Use raceline vx_mps as MPPI reference speed.'))
-        declf('speed_profile_scale', self.config.speed_profile_scale,
-              fdesc('Multiplies raceline vx_mps. Raise to push pace.',
-                    0.0, 3.0, 0.01))
-        declf('speed_profile_min_speed', self.config.speed_profile_min_speed,
-              fdesc('Lower clamp for profile speed (m/s).', 0.0, 20.0, 0.1))
-        declf('speed_profile_max_speed', self.config.speed_profile_max_speed,
-              fdesc('Upper clamp for profile speed (m/s).', 0.0, 25.0, 0.1))
-        decli('speed_profile_lookahead_steps', self.config.speed_profile_lookahead_steps,
-              idesc('Planning brake lookahead (steps).', 0, 20))
-        decli('speed_profile_iterations', self.config.speed_profile_iterations,
-              idesc('Profile rebuild passes per call.', 1, 10))
-
-        # ---- Speed profile (drive feedforward) ----
-        declb('use_speed_profile_drive_speed', self.config.use_speed_profile_drive_speed,
-              desc('Blend profile speed into final /drive.speed command.'))
-        declf('speed_profile_drive_blend', self.config.speed_profile_drive_blend,
-              fdesc('0 = pure MPPI accel; 1 = pure profile speed.', 0.0, 1.0, 0.01))
-        decli('speed_profile_drive_lookahead_steps', self.config.speed_profile_drive_lookahead_steps,
-              idesc('Command brake lookahead (future ref step).', 0, 20))
-        declb('speed_profile_drive_use_min_lookahead',
-              self.config.speed_profile_drive_use_min_lookahead,
-              desc('Use min speed through lookahead window.'))
-        declf('speed_profile_drive_max_accel', self.config.speed_profile_drive_max_accel,
-              fdesc('Max commanded speed increase rate (m/s^2).', 0.0, 30.0, 0.1))
-        declf('speed_profile_drive_max_decel', self.config.speed_profile_drive_max_decel,
-              fdesc('Max commanded speed decrease rate (m/s^2).', 0.0, 30.0, 0.1))
 
         # ---- Output safety clamps ----
         declf('min_speed', self.config.min_speed,
