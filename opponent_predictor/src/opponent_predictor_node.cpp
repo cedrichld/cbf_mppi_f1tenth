@@ -501,12 +501,22 @@ private:
     const double now_sec = stamp_sec > 0.0 ? stamp_sec : now().seconds();
     const double x = opponent_pose.pose.position.x;
     const double y = opponent_pose.pose.position.y;
+    if (!std::isfinite(now_sec) || !std::isfinite(x) || !std::isfinite(y)) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        1000,
+        "Ignoring non-finite opponent odom measurement.");
+      return;
+    }
     const Projection proj = projectToTrack(x, y);
 
     const double vx = msg->twist.twist.linear.x;
     const double vy = msg->twist.twist.linear.y;
     const double vz = msg->twist.twist.linear.z;
-    last_twist_speed_ = std::hypot(std::hypot(vx, vy), vz);
+    last_twist_speed_ = (std::isfinite(vx) && std::isfinite(vy) && std::isfinite(vz)) ?
+      std::hypot(std::hypot(vx, vy), vz) :
+      std::numeric_limits<double>::quiet_NaN();
 
     double s_meas = proj.s;
     double v_meas = last_twist_speed_;

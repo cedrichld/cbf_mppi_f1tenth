@@ -690,9 +690,22 @@ private:
 
   void egoOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
-    ego_x_ = msg->pose.pose.position.x;
-    ego_y_ = msg->pose.pose.position.y;
-    ego_yaw_ = yawFromQuaternion(msg->pose.pose.orientation);
+    const double x = msg->pose.pose.position.x;
+    const double y = msg->pose.pose.position.y;
+    const double yaw = yawFromQuaternion(msg->pose.pose.orientation);
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(yaw)) {
+      have_ego_ = false;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        1000,
+        "Ignoring non-finite ego odom measurement.");
+      return;
+    }
+
+    ego_x_ = x;
+    ego_y_ = y;
+    ego_yaw_ = yaw;
     ego_stamp_ = msg->header.stamp;
     have_ego_ = true;
   }
