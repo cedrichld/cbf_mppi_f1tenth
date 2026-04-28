@@ -101,6 +101,15 @@ lmppi_node:
     steer_sat_soft_ratio: 0.85
 
 
+    # MPPI warm-start watchdog. If comms/timing hiccups or a bad local plan
+    # leave the optimizer biased, reset the shifted control sequence instead
+    # of carrying that bad plan for many future callbacks.
+    mppi_reset_on_timing_jump: true
+    mppi_reset_wall_gap: 0.25
+    mppi_reset_stamp_gap: 0.25
+    mppi_reset_aopt_threshold: 0.98
+
+
     ######################################################
     ###################### BACKEND #######################
     ######################################################
