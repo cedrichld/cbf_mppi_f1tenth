@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <fstream>
@@ -157,6 +158,12 @@ public:
     timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / publish_rate_hz_),
       std::bind(&OpponentPredictorNode::timerCallback, this));
+
+    // Live params refreshed at 2 Hz instead of on every odom/timer callback
+    // (was ~30 Hz x ~25 mutex-protected param fetches).
+    params_timer_ = create_wall_timer(
+      std::chrono::milliseconds(500),
+      std::bind(&OpponentPredictorNode::refreshLiveParams, this));
 
     RCLCPP_INFO(
       get_logger(),
@@ -486,8 +493,7 @@ private:
 
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
-    refreshLiveParams();
-
+    // refreshLiveParams() moved to params_timer_ (2 Hz) — see ctor.
     if (waypoints_.empty()) {
       return;
     }
@@ -816,8 +822,7 @@ private:
 
   void timerCallback()
   {
-    refreshLiveParams();
-
+    // refreshLiveParams() moved to params_timer_ (2 Hz) — see ctor.
     if (!initialized_ || waypoints_.empty()) {
       return;
     }
@@ -895,6 +900,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr debug_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr params_timer_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 };

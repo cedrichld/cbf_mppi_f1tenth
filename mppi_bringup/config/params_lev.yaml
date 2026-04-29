@@ -5,11 +5,14 @@ lmppi_node:
     # JAX compilation, or the random sampling stream.
     is_sim: false                  # true: /ego_racecar/odom; false: /pf/pose/odom.
     state_predictor: dynamic_ST   # Rollout model. dynamic_ST includes yaw rate/slip; kinematic_ST is simpler.
-    n_samples: 1024               # Number of sampled control sequences. More is steadier but slower.
+    n_samples: 2048               # Number of sampled control sequences. More is steadier but slower.
     n_steps: 10 #try lower                   # Rollout horizon length. At dt=0.1, 12 steps = 1.2s lookahead.
     sim_time_step: 0.1            # Rollout integration/control timestep used inside MPPI.
     random_seed: 527787           # Sampling seed. Keep fixed for repeatable tuning runs.
     render: false                 # Race hardware: avoid extra rollout/sync unless debugging trajectories.
+    
+    # timer
+    control_loop_hz: 40.0
 
     # Live tuning parameters: mppi_node.get_params() refreshes these on every
     # odometry callback, so they can be changed with ros2 param set.

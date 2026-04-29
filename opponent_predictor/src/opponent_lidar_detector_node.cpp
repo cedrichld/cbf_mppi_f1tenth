@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -8,6 +10,7 @@
 #include <queue>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "ament_index_cpp/get_package_share_directory.hpp"
@@ -140,10 +143,36 @@ public:
     marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(detector_marker_topic_, debug_qos);
     debug_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>(detector_debug_topic_, debug_qos);
 
+    // Live params are refreshed on a slow timer instead of on every scan
+    // (15 Hz x 25 mutex-protected param fetches was real overhead). The
+    // refresh also rebuilds the inflated map if inflation/threshold/treat-
+    // unknown changed, so live retuning still works.
+    params_timer_ = create_wall_timer(
+      std::chrono::milliseconds(500),
+      std::bind(&OpponentLidarDetectorNode::onParamsTimer, this));
+
     RCLCPP_INFO(
       get_logger(),
       "Opponent LiDAR detector ready: scan=%s ego=%s map=%s waypoints=%zu",
       scan_topic_.c_str(), ego_odom_topic_.c_str(), map_topic_.c_str(), waypoints_.size());
+  }
+
+  void onParamsTimer()
+  {
+    refreshLiveParams();
+    // Rebuild the inflated mask iff a relevant param changed since last build.
+    const int desired_inflation = static_map_.info.resolution > 0.0 ?
+      static_cast<int>(std::ceil(wall_inflation_radius_ / static_map_.info.resolution)) :
+      0;
+    if (
+      map_received_ &&
+      (inflated_map_.empty() ||
+       desired_inflation != inflated_inflation_cells_ ||
+       occupied_threshold_ != inflated_occupied_threshold_ ||
+       treat_unknown_as_static_ != inflated_treat_unknown_))
+    {
+      rebuildInflatedMap();
+    }
   }
 
 private:
@@ -333,77 +362,167 @@ private:
     return best;
   }
 
+  // O(1) point-vs-inflated-map test. The inflation is precomputed once on
+  // map receipt (or on relevant param change) by rebuildInflatedMap(); the
+  // old implementation did a (2*inflation+1)^2 cell sweep PER scan point per
+  // scan, which dominated the scan callback budget on Jetson and contended
+  // with JAX's GPU<->host DMA via memory bandwidth.
   bool pointNearStaticMap(double x, double y) const
   {
-    if (!map_received_) {
+    if (!map_received_ || inflated_map_.empty()) {
       return require_static_map_;
     }
-
     const auto & info = static_map_.info;
-    if (info.resolution <= 0.0 || info.width == 0 || info.height == 0) {
-      return require_static_map_;
-    }
-
     const int mx = static_cast<int>((x - info.origin.position.x) / info.resolution);
     const int my = static_cast<int>((y - info.origin.position.y) / info.resolution);
     if (mx < 0 || mx >= static_cast<int>(info.width) || my < 0 || my >= static_cast<int>(info.height)) {
-      return true;
+      return true;  // out-of-bounds matches old semantics
     }
-
-    const int inflation_cells = std::max(0, static_cast<int>(std::ceil(wall_inflation_radius_ / info.resolution)));
-    for (int dy = -inflation_cells; dy <= inflation_cells; ++dy) {
-      const int yy = my + dy;
-      if (yy < 0 || yy >= static_cast<int>(info.height)) {
-        continue;
-      }
-      for (int dx = -inflation_cells; dx <= inflation_cells; ++dx) {
-        const int xx = mx + dx;
-        if (xx < 0 || xx >= static_cast<int>(info.width)) {
-          continue;
-        }
-        const int8_t value = static_map_.data[yy * info.width + xx];
-        if (value >= occupied_threshold_ || (treat_unknown_as_static_ && value < 0)) {
-          return true;
-        }
-      }
-    }
-    return false;
+    return inflated_map_[static_cast<std::size_t>(my) * info.width + mx] != 0;
   }
 
+  // Brute-force precompute of the dilated occupancy mask. Runs once per map
+  // receipt and again only if inflation/threshold/treat-unknown params change
+  // (detected in onParamsTimer). One-time cost ~10-30 ms on a Levine-sized
+  // map (~340x255). Per-scan cost afterwards is O(1) per point.
+  void rebuildInflatedMap()
+  {
+    if (!map_received_) {
+      inflated_map_.clear();
+      return;
+    }
+    const auto & info = static_map_.info;
+    if (info.resolution <= 0.0 || info.width == 0 || info.height == 0) {
+      inflated_map_.clear();
+      return;
+    }
+    const int width = static_cast<int>(info.width);
+    const int height = static_cast<int>(info.height);
+    const int inflation_cells = std::max(0,
+      static_cast<int>(std::ceil(wall_inflation_radius_ / info.resolution)));
+
+    // Step 1: blocked-base mask (occupied OR unknown-as-static).
+    std::vector<uint8_t> blocked(static_cast<std::size_t>(width) * height, 0);
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        const int8_t v = static_map_.data[y * width + x];
+        if (v >= occupied_threshold_ || (treat_unknown_as_static_ && v < 0)) {
+          blocked[static_cast<std::size_t>(y) * width + x] = 1;
+        }
+      }
+    }
+
+    // Step 2: dilation. For each blocked cell, mark a (2k+1)^2 window in the
+    // result. We iterate over BLOCKED source cells (typically a small
+    // fraction of the map) instead of every cell, which is ~10x faster than
+    // the naive "for each cell, check k-window of source".
+    inflated_map_.assign(static_cast<std::size_t>(width) * height, 0);
+    if (inflation_cells == 0) {
+      inflated_map_ = blocked;
+    } else {
+      for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+          if (!blocked[static_cast<std::size_t>(y) * width + x]) {
+            continue;
+          }
+          const int y_lo = std::max(0, y - inflation_cells);
+          const int y_hi = std::min(height - 1, y + inflation_cells);
+          const int x_lo = std::max(0, x - inflation_cells);
+          const int x_hi = std::min(width - 1, x + inflation_cells);
+          for (int yy = y_lo; yy <= y_hi; ++yy) {
+            std::fill(
+              inflated_map_.begin() + static_cast<std::size_t>(yy) * width + x_lo,
+              inflated_map_.begin() + static_cast<std::size_t>(yy) * width + x_hi + 1,
+              uint8_t{1});
+          }
+        }
+      }
+    }
+
+    inflated_inflation_cells_ = inflation_cells;
+    inflated_occupied_threshold_ = occupied_threshold_;
+    inflated_treat_unknown_ = treat_unknown_as_static_;
+    RCLCPP_INFO(
+      get_logger(),
+      "Inflated static-map mask rebuilt: %dx%d, inflation_cells=%d",
+      width, height, inflation_cells);
+  }
+
+  // Grid-bucketed connected-components. Cell size = cluster_tolerance_, so
+  // any point within tolerance of `idx` lives in idx's cell or one of its 8
+  // neighbours. Replaces O(N^2) brute-force region-grow with O(N) expected.
+  // Functional output is identical (BFS over the same neighbour graph) — only
+  // the candidate-pair generation changes.
   std::vector<std::vector<int>> clusterPoints(const std::vector<ScanPoint> & points) const
   {
     std::vector<std::vector<int>> clusters;
-    std::vector<bool> visited(points.size(), false);
+    if (points.empty()) {
+      return clusters;
+    }
+
+    const double cell = std::max(cluster_tolerance_, 1e-3);
+    const double inv_cell = 1.0 / cell;
     const double tol2 = cluster_tolerance_ * cluster_tolerance_;
 
+    auto key_of = [inv_cell](double x, double y) -> int64_t {
+      // 32-bit halves -> 64-bit key. Range ~ +/-1e9 cells which is safely
+      // beyond any racetrack scale.
+      const int32_t cx = static_cast<int32_t>(std::floor(x * inv_cell));
+      const int32_t cy = static_cast<int32_t>(std::floor(y * inv_cell));
+      return (static_cast<int64_t>(cx) << 32) ^ static_cast<int64_t>(static_cast<uint32_t>(cy));
+    };
+
+    std::unordered_map<int64_t, std::vector<int>> grid;
+    grid.reserve(points.size() * 2);
+    std::vector<int32_t> cx_of(points.size());
+    std::vector<int32_t> cy_of(points.size());
     for (std::size_t i = 0; i < points.size(); ++i) {
-      if (visited[i]) {
+      const int32_t cx = static_cast<int32_t>(std::floor(points[i].map_x * inv_cell));
+      const int32_t cy = static_cast<int32_t>(std::floor(points[i].map_y * inv_cell));
+      cx_of[i] = cx;
+      cy_of[i] = cy;
+      const int64_t k = (static_cast<int64_t>(cx) << 32) ^ static_cast<int64_t>(static_cast<uint32_t>(cy));
+      grid[k].push_back(static_cast<int>(i));
+    }
+
+    std::vector<bool> visited(points.size(), false);
+    std::queue<int> q;
+    for (std::size_t seed = 0; seed < points.size(); ++seed) {
+      if (visited[seed]) {
         continue;
       }
-
+      visited[seed] = true;
+      q.push(static_cast<int>(seed));
       std::vector<int> cluster;
-      std::queue<int> q;
-      visited[i] = true;
-      q.push(static_cast<int>(i));
-
       while (!q.empty()) {
         const int idx = q.front();
         q.pop();
         cluster.push_back(idx);
-
-        for (std::size_t j = 0; j < points.size(); ++j) {
-          if (visited[j]) {
-            continue;
-          }
-          const double dx = points[idx].map_x - points[j].map_x;
-          const double dy = points[idx].map_y - points[j].map_y;
-          if (dx * dx + dy * dy <= tol2) {
-            visited[j] = true;
-            q.push(static_cast<int>(j));
+        const int32_t cx = cx_of[idx];
+        const int32_t cy = cy_of[idx];
+        for (int32_t dy = -1; dy <= 1; ++dy) {
+          for (int32_t dx = -1; dx <= 1; ++dx) {
+            const int64_t nk = (static_cast<int64_t>(cx + dx) << 32) ^
+              static_cast<int64_t>(static_cast<uint32_t>(cy + dy));
+            auto it = grid.find(nk);
+            if (it == grid.end()) {
+              continue;
+            }
+            for (const int j : it->second) {
+              if (visited[j]) {
+                continue;
+              }
+              const double ddx = points[idx].map_x - points[j].map_x;
+              const double ddy = points[idx].map_y - points[j].map_y;
+              if (ddx * ddx + ddy * ddy <= tol2) {
+                visited[j] = true;
+                q.push(j);
+              }
+            }
           }
         }
       }
-      clusters.push_back(cluster);
+      clusters.push_back(std::move(cluster));
     }
     return clusters;
   }
@@ -714,11 +833,13 @@ private:
   {
     static_map_ = *msg;
     map_received_ = true;
+    rebuildInflatedMap();
   }
 
   void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
   {
-    refreshLiveParams();
+    // refreshLiveParams() moved to onParamsTimer (2 Hz) — see ctor.
+    const auto cb_t0 = std::chrono::steady_clock::now();
 
     if (!have_ego_) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Waiting for ego odom.");
@@ -793,6 +914,13 @@ private:
       publishMarkers(dynamic_points, nullptr, stamp);
       publishDebug(dynamic_points.size(), clusters.size(), nullptr, 0.0);
     }
+
+    const auto cb_dt_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - cb_t0).count();
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "scanCallback %.2f ms | dyn_pts=%zu clusters=%zu",
+      cb_dt_ms, dynamic_points.size(), clusters.size());
   }
 
   std::string scan_topic_;
@@ -844,6 +972,13 @@ private:
 
   bool map_received_ = false;
   nav_msgs::msg::OccupancyGrid static_map_;
+  // Precomputed inflated occupancy mask (1 = blocked-after-inflation), same
+  // dimensions as static_map_. Rebuilt from rebuildInflatedMap().
+  std::vector<uint8_t> inflated_map_;
+  int inflated_inflation_cells_ = -1;
+  int inflated_occupied_threshold_ = -1;
+  bool inflated_treat_unknown_ = true;
+  rclcpp::TimerBase::SharedPtr params_timer_;
 
   std::vector<Waypoint> waypoints_;
   double track_length_ = 0.0;
