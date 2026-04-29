@@ -8,6 +8,8 @@ import jax.numpy as jnp
 
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from nav_msgs.msg import Odometry, Path as NavPath
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import Point
@@ -134,13 +136,30 @@ class MPPI_Node(Node):
             False,
         )
         self.get_logger().info('MPPI initialized')
-        self.hz = []
         self.last_speed_command_time = None
         self.last_pose_callback_wall_time = None
         self.last_pose_msg_time = None
         self.mppi_guard_count = 0
         self.mppi_saturation_count = 0
         self.mppi_bad_output_count = 0
+
+        # Timer-driven control loop state. pose_callback only writes
+        # latest_pose_msg + recv_time; control_timer reads them. CPython
+        # attribute assignment is atomic, so a single-pointer swap is race-free.
+        self.latest_pose_msg = None
+        self.latest_pose_recv_time = None
+        self.last_control_step_wall_time = None
+        # Rolling stats for the periodic logger.
+        self._stats_window_start = time.time()
+        self._stats_pose_rx = 0
+        self._stats_drive_tx = 0
+        self._stats_control_ticks = 0
+        self._stats_control_skips_stale = 0
+        self._stats_control_skips_no_pose = 0
+        self._stats_solve_times = []
+        self._stats_pose_age = 0.0
+        self._stats_guard_count_at_window_start = 0
+        self._stats_opponent_rx = 0
         self.last_timing_debug = {
             'callback_wall_dt': 0.0,
             'callback_stamp_dt': 0.0,
@@ -184,16 +203,28 @@ class MPPI_Node(Node):
             reliability=rclpy.qos.QoSReliabilityPolicy.BEST_EFFORT,
             durability=rclpy.qos.QoSDurabilityPolicy.VOLATILE,
         )
+        # Reentrant group so pose_callback (cache-only) and control_timer
+        # (the solve) can run concurrently under the MultiThreadedExecutor.
+        # opponent_path_callback joins the same group; it touches independent
+        # state. Service + stats_timer stay in the default group.
+        self._control_group = ReentrantCallbackGroup()
         # create subscribers
         if self.config.is_sim:
-            self.pose_sub = self.create_subscription(Odometry, "/ego_racecar/odom", self.pose_callback, sensor_qos)
+            self.pose_sub = self.create_subscription(
+                Odometry, "/ego_racecar/odom", self.pose_callback,
+                sensor_qos, callback_group=self._control_group,
+            )
         else:
-            self.pose_sub = self.create_subscription(Odometry, "/pf/pose/odom", self.pose_callback, sensor_qos)
+            self.pose_sub = self.create_subscription(
+                Odometry, "/pf/pose/odom", self.pose_callback,
+                sensor_qos, callback_group=self._control_group,
+            )
         self.opponent_path_sub = self.create_subscription(
             NavPath,
             self.config.opponent_path_topic,
             self.opponent_path_callback,
             sensor_qos,
+            callback_group=self._control_group,
         )
         # publishers
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", qos)
@@ -212,6 +243,24 @@ class MPPI_Node(Node):
             UpdateRaceline, '/mppi/update_raceline', self.update_raceline_callback
         )
         self.get_logger().info('Raceline update service ready at /mppi/update_raceline')
+
+        # Fixed-rate control loop. Period derived from control_loop_hz at
+        # startup (read_only param so we do not need to re-create the timer).
+        control_period = 1.0 / max(1.0, float(self.config.control_loop_hz))
+        self.control_loop_timer = self.create_timer(
+            control_period, self.control_timer, callback_group=self._control_group,
+        )
+        self.get_logger().info(
+            f'Control loop timer at {self.config.control_loop_hz:.1f} Hz '
+            f'(period {control_period*1000:.1f} ms)'
+        )
+
+        # Periodic stats logger. Default group so it never competes with the
+        # control loop for callback-group slots.
+        if self.config.stats_log_interval_sec > 0.0:
+            self.stats_log_timer = self.create_timer(
+                self.config.stats_log_interval_sec, self.stats_timer,
+            )
 
     def update_raceline_callback(self, request, response):
         try:
@@ -336,6 +385,12 @@ class MPPI_Node(Node):
             'state_est_wz_prior': 0.40,
             'state_est_hiccup_dt': 0.06,
             'state_est_hiccup_prior_scale': 0.35,
+            # Timer-driven control loop. MPPI ticks at fixed rate independent of
+            # PF cadence. Required so /scan or PF degradation under load
+            # (rosbag, opponent node) does not slow the controller down with it.
+            'control_loop_hz': 25.0,
+            'control_pose_stale_sec': 0.20,
+            'stats_log_interval_sec': 5.0,
 
         }
         for key, value in defaults.items():
@@ -622,6 +677,14 @@ class MPPI_Node(Node):
               fdesc('Odom dt above this reduces vy/wz prior weights.', 0.0, 0.5, 0.005))
         declf('state_est_hiccup_prior_scale', self.config.state_est_hiccup_prior_scale,
               fdesc('Multiplier on vy/wz prior weights after an odom timing hiccup.', 0.0, 1.0, 0.01))
+        # Timer-driven control loop. control_loop_hz is read at startup to
+        # build the timer; pose-stale and stats-interval are live-tunable.
+        declf('control_loop_hz', self.config.control_loop_hz,
+              fdesc('[startup] Fixed-rate control loop frequency (Hz).', 1.0, 100.0, 1.0, read_only=True))
+        declf('control_pose_stale_sec', self.config.control_pose_stale_sec,
+              fdesc('Skip MPPI solve if cached pose age exceeds this (sec).', 0.05, 1.0, 0.01))
+        declf('stats_log_interval_sec', self.config.stats_log_interval_sec,
+              fdesc('Periodic stats logger interval (sec). 0 disables.', 0.0, 60.0, 0.5))
 
     def get_params(self, startup=False):
         if startup:
@@ -906,6 +969,16 @@ class MPPI_Node(Node):
             0.0,
             1.0,
         ))
+        if startup:
+            self.config.control_loop_hz = float(np.clip(
+                float(self.get_parameter('control_loop_hz').value), 1.0, 100.0,
+            ))
+        self.config.control_pose_stale_sec = max(
+            0.0, float(self.get_parameter('control_pose_stale_sec').value),
+        )
+        self.config.stats_log_interval_sec = max(
+            0.0, float(self.get_parameter('stats_log_interval_sec').value),
+        )
 
         if hasattr(self, 'infer_env'):
             self.infer_env.config = self.config
@@ -949,6 +1022,7 @@ class MPPI_Node(Node):
         return float(self.get_clock().now().nanoseconds) * 1e-9
 
     def opponent_path_callback(self, msg):
+        self._stats_opponent_rx += 1
         poses = list(msg.poses)
         if not poses:
             self.opponent_path_time = None
@@ -1430,12 +1504,49 @@ class MPPI_Node(Node):
 
     def pose_callback(self, pose_msg):
         """
-        Callback function for subscribing to particle filter's  inferred pose.
-        This funcion saves the current pose of the car and obtain the goal
-        waypoint from the pure pursuit module.
+        Lightweight: cache latest odom + recv time. The control loop runs on
+        a fixed-rate timer, not on this callback. Keeping this minimal lets
+        the cache update during an in-progress MPPI solve under a
+        MultiThreadedExecutor — so PF cadence variation does not throttle
+        the controller.
+        """
+        self.latest_pose_msg = pose_msg
+        self.latest_pose_recv_time = time.time()
+        self._stats_pose_rx += 1
 
-        Args: 
-            pose_msg (PoseStamped): incoming message from subscribed topic
+    def control_timer(self):
+        """Fixed-rate driver of the MPPI solve.
+
+        Reads the cached pose, checks staleness, and either calls
+        control_step or skips. Skipping is silent in /drive (no republish);
+        downstream sees the last command persist until a fresh pose lets us
+        compute a new one.
+        """
+        self._stats_control_ticks += 1
+        pose_msg = self.latest_pose_msg
+        if pose_msg is None:
+            self._stats_control_skips_no_pose += 1
+            return
+        now = time.time()
+        msg_stamp = self.stamp_to_sec(pose_msg.header.stamp)
+        if msg_stamp <= 0.0 or not np.isfinite(msg_stamp):
+            # Fall back to recv time if upstream stamps are bad.
+            msg_stamp = self.latest_pose_recv_time or now
+        # Pose age uses recv time + (now - recv) as an upper bound on
+        # in-pipeline staleness; this is independent of clock drift between
+        # PF and the controller.
+        recv_age = now - (self.latest_pose_recv_time or now)
+        self._stats_pose_age = recv_age
+        if recv_age > self.config.control_pose_stale_sec:
+            self._stats_control_skips_stale += 1
+            return
+        self.control_step(pose_msg)
+
+    def control_step(self, pose_msg):
+        """The MPPI solve + /drive publish. Was previously `pose_callback`.
+
+        Live param refresh happens here, at the timer rate, not at the PF
+        callback rate.
         """
         t1 = time.time()
         self.get_params()
@@ -1608,11 +1719,12 @@ class MPPI_Node(Node):
         drive_msg.drive.steering_angle = self.control[0]
         drive_msg.drive.speed = self.control[1]
         self.drive_pub.publish(drive_msg)
-        self.hz.append(1/(time.time() - t1))
-        if len(self.hz) == 100:
-            self.hz = np.mean(self.hz)
-            print(f"MPPI Hz: {self.hz:.2f}")
-            self.hz = []
+        self._stats_drive_tx += 1
+        solve_dt = time.time() - t1
+        self._stats_solve_times.append(solve_dt)
+        if len(self._stats_solve_times) > 1024:
+            # bound memory under stats_log_interval=0
+            self._stats_solve_times = self._stats_solve_times[-256:]
 
         if self.reference_pub.get_subscription_count() > 0:
             ref_traj_cpu = numpify(reference_traj)
@@ -1636,15 +1748,77 @@ class MPPI_Node(Node):
                 self.config.speed_profile_drive_blend,
             ], dtype=np.float32)
             self.speed_debug_pub.publish(to_multiarray_f32(speed_debug))
-        
+
+    def stats_timer(self):
+        """Periodic, NON-buffered Hz/timing report.
+
+        Replaces the old `print(f"MPPI Hz: ...")` block, which was inside the
+        callback and used `print()` — block-buffered under `ros2 launch` so it
+        only flushed at SIGINT. This uses get_logger() which is unbuffered, and
+        runs from a timer so it fires whether or not the callback is running.
+        """
+        if self.config.stats_log_interval_sec <= 0.0:
+            return
+        now = time.time()
+        window = now - self._stats_window_start
+        if window <= 0.0:
+            return
+        guard_delta = self.mppi_guard_count - self._stats_guard_count_at_window_start
+        solves = self._stats_solve_times
+        if solves:
+            arr = np.asarray(solves, dtype=float)
+            solve_mean = float(arr.mean())
+            solve_p99 = float(np.percentile(arr, 99))
+            solve_max = float(arr.max())
+        else:
+            solve_mean = solve_p99 = solve_max = 0.0
+        self.get_logger().info(
+            "MPPI {:5.1f}Hz | pose_rx {:5.1f}Hz | drive_tx {:5.1f}Hz | "
+            "ctrl_ticks {:5.1f}Hz (skip stale={} no_pose={}) | "
+            "solve mean={:5.1f}ms p99={:5.1f}ms max={:5.1f}ms | "
+            "pose_age={:5.1f}ms | guard+={} | opp_rx {:4.1f}Hz".format(
+                self._stats_drive_tx / window,
+                self._stats_pose_rx / window,
+                self._stats_drive_tx / window,
+                self._stats_control_ticks / window,
+                self._stats_control_skips_stale,
+                self._stats_control_skips_no_pose,
+                solve_mean * 1000.0,
+                solve_p99 * 1000.0,
+                solve_max * 1000.0,
+                self._stats_pose_age * 1000.0,
+                guard_delta,
+                self._stats_opponent_rx / window,
+            )
+        )
+        # Reset window.
+        self._stats_window_start = now
+        self._stats_pose_rx = 0
+        self._stats_drive_tx = 0
+        self._stats_control_ticks = 0
+        self._stats_control_skips_stale = 0
+        self._stats_control_skips_no_pose = 0
+        self._stats_solve_times = []
+        self._stats_guard_count_at_window_start = self.mppi_guard_count
+        self._stats_opponent_rx = 0
+
 
 def main(args=None):
     rclpy.init(args=args)
     mppi_node = MPPI_Node()
-    rclpy.spin(mppi_node)
-
-    mppi_node.destroy_node()
-    rclpy.shutdown()
+    # MultiThreadedExecutor lets the lightweight pose_callback (cache-only)
+    # interleave with an in-progress MPPI solve. The solve itself releases the
+    # GIL during JAX GPU calls and during numpify(), so the cache update
+    # actually runs concurrently. With a single-threaded executor, a slow
+    # solve would block all callbacks and PF cadence variation would directly
+    # throttle the controller.
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(mppi_node)
+    try:
+        executor.spin()
+    finally:
+        mppi_node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
