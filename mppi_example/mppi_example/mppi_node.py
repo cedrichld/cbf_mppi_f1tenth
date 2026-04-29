@@ -352,7 +352,7 @@ class MPPI_Node(Node):
             'reference_line_width': 0.06,
             'optimal_line_width': 0.08,
             'sampled_line_width': 0.025,
-            'sampled_trajectory_count': 64,
+            'sampled_trajectory_count': 0,
             'sampled_trajectory_alpha': 0.18,
             'wall_cost_enabled': False,
             'wall_cost_weight': 0.0,
@@ -673,7 +673,7 @@ class MPPI_Node(Node):
         declf('sampled_line_width', self.config.sampled_line_width,
               fdesc('Sampled rollout (orange) line width (m).', 0.0, 0.5, 0.005))
         decli('sampled_trajectory_count', self.config.sampled_trajectory_count,
-              idesc('Number of sampled rollouts to draw.', 0, 256))
+              idesc('Number of sampled rollouts to draw.', 0, 64))
         declf('sampled_trajectory_alpha', self.config.sampled_trajectory_alpha,
               fdesc('Sampled rollout transparency.', 0.0, 1.0, 0.01))
         declb('mppi_guard_on_timing_jump', self.config.mppi_guard_on_timing_jump,
