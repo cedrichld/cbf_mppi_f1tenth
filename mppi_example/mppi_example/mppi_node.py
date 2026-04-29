@@ -1,3 +1,4 @@
+import gc
 import os
 import time
 from pathlib import Path
@@ -42,9 +43,12 @@ except ImportError:
 jax.config.update("jax_compilation_cache_dir",
                   os.environ.get("JAX_CACHE_DIR", os.path.expanduser("~/jax_cache")))
 
+# DIAGNOSTIC METRIC: set MPPI_LOG_JAX_COMPILES=1 to log every JAX compilation. After
+# the startup warmup, no compiles should happen during normal operation.
+# Compiles during steady-state correlate with multi-second solve spikes.
+if os.environ.get("MPPI_LOG_JAX_COMPILES", "").lower() in ("1", "true", "yes"):
+    jax.config.update("jax_log_compiles", True)
 
-## This is a demosntration of how to use the MPPI planner with the Roboracer
-## Zirui Zang 2025/04/07
 
 class MPPI_Node(Node):
     DEBUG_SCALAR_TOPICS = {
@@ -135,6 +139,19 @@ class MPPI_Node(Node):
             jnp.asarray(self.opponent_xy_horizon),
             False,
         )
+        # Pre-warm sample_wall_distance with the (n_probes, 2) shape that
+        # opponent_pass_clearance will use at runtime. Without this, the
+        # first auto-pass evaluation during the race triggers a one-shot
+        # ~75-150 ms XLA compile that manifests as a SOFT timing gap
+        # right when an opponent first appears in front of the car —
+        # exactly when continuity matters most.
+        try:
+            n_probes = max(1, int(getattr(self.config, 'opponent_auto_check_steps', 3)))
+            if getattr(self.infer_env, 'wall_sdf', None) is not None:
+                self.infer_env.sample_wall_distance(
+                    jnp.zeros((n_probes, 2), dtype=jnp.float32))
+        except Exception as exc:  # noqa: BLE001 — pre-warm best-effort
+            self.get_logger().warn(f"sample_wall_distance pre-warm skipped: {exc}")
         self.get_logger().info('MPPI initialized')
         self.last_speed_command_time = None
         self.last_pose_callback_wall_time = None
@@ -282,6 +299,22 @@ class MPPI_Node(Node):
         # blocking pose_callback under the MultiThreadedExecutor. Default
         # callback group keeps it off the control hot path.
         self.params_refresh_timer = self.create_timer(0.5, self.get_params)
+
+        # Stop Python gen-2 garbage collection from firing during a race.
+        # JAX's compile cache + traced objects make the gen-2 sweep walk a
+        # large heap; the walk itself is O(heap size) and takes 300-500 ms
+        # regardless of how much is actually freed. With default thresholds
+        # this fires every ~30 s and shows up as solve_max=500ms spikes and
+        # SOFT timing gaps with NO JAX compile activity around them.
+        #
+        # We DO NOT manually call gc.collect() — at any frequency, each
+        # call still pays the full walk cost; "amortizing" makes things
+        # strictly worse (tested: 4 Hz manual = continuous stalling).
+        # Instead we set the gen-2 threshold absurdly high so auto gen-2
+        # effectively never fires for the duration of a race session.
+        # Gen-0/1 stay auto (cheap, sub-ms). Cyclic-only objects may
+        # accumulate, but for minute-scale sessions JAX's heap is bounded.
+        gc.set_threshold(700, 10, 100000)
 
     def update_raceline_callback(self, request, response):
         try:
@@ -1146,28 +1179,42 @@ class MPPI_Node(Node):
         return speed
 
     def opponent_pass_clearance(self, opponent_traj, reference_traj, side):
+        """Probe wall clearance at the candidate pass-side position.
+
+        IMPORTANT: candidates is a FIXED-SHAPE (n_probes, 2) buffer where
+        n_probes = opponent_auto_check_steps. sample_wall_distance is called
+        via JAX eager dispatch from a non-JIT context — each unique input
+        shape triggers a fresh XLA compile (~100-500 ms holding the GIL,
+        plus a cascade of supporting ops, totaling 1-2 s spikes that
+        manifested as solve_max=1500 ms in stats logs and SOFT timing-gap
+        warnings). Padding the buffer to a constant length keeps the JAX
+        trace cache hot after the first call. Source compile-log evidence:
+        "Compiling sample_wall_distance with global shapes float32[3,2]"
+        seen sporadically in mid-run before this fix.
+        """
         if (
             self.config.opponent_auto_wall_check_enabled
             and getattr(self.infer_env, 'wall_sdf', None) is None
         ):
             return 0.0
 
-        n = min(
-            max(1, int(self.config.opponent_auto_check_steps)),
-            opponent_traj.shape[0],
-            max(1, reference_traj.shape[0] - 1),
-        )
+        n_probes = max(1, int(self.config.opponent_auto_check_steps))
+        opp_n = int(opponent_traj.shape[0])
+        ref_n = int(reference_traj.shape[0])
         pass_offset = max(
             float(self.config.opponent_pass_lateral_offset),
             float(self.config.opponent_cost_radius),
         )
-        candidates = []
-        for k in range(n):
-            ref_idx = min(k + 1, reference_traj.shape[0] - 1)
+        # Fixed-shape buffer. If opp_traj or ref_traj are shorter than
+        # n_probes, clamp to the last valid index — keeps geometry sensible
+        # without varying the JAX input shape.
+        candidates = np.zeros((n_probes, 2), dtype=np.float32)
+        for k in range(n_probes):
+            opp_idx = min(k, opp_n - 1)
+            ref_idx = min(k + 1, ref_n - 1)
             yaw = float(reference_traj[ref_idx, 3])
             normal = np.asarray([-np.sin(yaw), np.cos(yaw)], dtype=float)
-            candidates.append(opponent_traj[k, :2] + side * pass_offset * normal)
-        candidates = np.asarray(candidates, dtype=np.float32)
+            candidates[k] = opponent_traj[opp_idx, :2] + side * pass_offset * normal
 
         wall_dist = np.asarray(
             self.infer_env.sample_wall_distance(jnp.asarray(candidates)),
