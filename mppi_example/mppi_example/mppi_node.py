@@ -267,6 +267,13 @@ class MPPI_Node(Node):
                 self.config.stats_log_interval_sec, self.stats_timer,
             )
 
+        # Refresh live params at 2 Hz instead of inside control_step. The
+        # rclpy parameter service is mutex-protected pure-Python; reading
+        # ~50 params at 40 Hz held the GIL ~20%+ of wall time, head-of-line
+        # blocking pose_callback under the MultiThreadedExecutor. Default
+        # callback group keeps it off the control hot path.
+        self.params_refresh_timer = self.create_timer(0.5, self.get_params)
+
     def update_raceline_callback(self, request, response):
         try:
             if request.format != 'mppi':
@@ -1551,11 +1558,12 @@ class MPPI_Node(Node):
     def control_step(self, pose_msg):
         """The MPPI solve + /drive publish. Was previously `pose_callback`.
 
-        Live param refresh happens here, at the timer rate, not at the PF
-        callback rate.
+        Live params are refreshed by params_refresh_timer (2 Hz), NOT here:
+        ~50 mutex'd parameter reads at 40 Hz held the GIL long enough to
+        starve pose_callback under the MultiThreadedExecutor. 0.5 s refresh
+        latency is fine for interactive `ros2 param set` tuning.
         """
         t1 = time.time()
-        self.get_params()
         pose = pose_msg.pose.pose
         twist = pose_msg.twist.twist
         theta = self.quaternion_to_yaw(pose.orientation)
