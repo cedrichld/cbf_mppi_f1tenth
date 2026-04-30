@@ -12,11 +12,11 @@ lmppi_node:
     render: true                  # true keeps optimal/sampled rollouts available for visualization.
 
     # timer
-    control_loop_hz: 50.0
+    control_loop_hz: 40.0
 
     # Live tuning parameters: mppi_node.get_params() refreshes these on every
     # odometry callback, so they can be changed with ros2 param set.
-    temperature: 0.01             # MPPI greediness. Lower = winner-take-all; higher = smoother averaging.
+    temperature: 0.001             # MPPI greediness. Lower = winner-take-all; higher = smoother averaging.
     # damping: 0.001                # Prevents weight normalization issues when rollout rewards are similar.
     # ref_vel: 5.0                  # OLD: Legacy constant-speed reference seed. Mostly bypassed when profile is on.
     init_vel: 1.3                 # Minimum speed assumed by the rollout model at startup/very low speed.
@@ -29,7 +29,7 @@ lmppi_node:
     # These affect what MPPI optimizes against: future XY points and velocity
     # targets become slower in turns and faster on straights.
     use_waypoint_speed_profile: true   # true: use raceline vx_mps; false: use constant ref_vel spacing.
-    speed_profile_scale: 1.0          # Multiplies raceline vx_mps. Raise to push pace; lower for stability.
+    speed_profile_scale: 1.4          # Multiplies raceline vx_mps. Raise to push pace; lower for stability.
     speed_profile_min_speed: 1.0       # Lower clamp for reference/profile speed after scaling.
     speed_profile_max_speed: 12.0      # Upper clamp for reference/profile speed after scaling.
     speed_profile_lookahead_steps: 0   # Planning brake lookahead: min speed over current..N future ref steps.
@@ -73,7 +73,7 @@ lmppi_node:
     opponent_path_topic: /opponent/predicted_path
     opponent_cost_enabled: true
     opponent_cost_weight: 200.0
-    opponent_cost_radius: 0.5
+    opponent_cost_radius: 0.4
     opponent_cost_power: 2.0
     opponent_cost_discount: 1.0
     opponent_path_timeout: 0.5
@@ -82,7 +82,7 @@ lmppi_node:
     opponent_follow_distance: 1.2        # Desired gap behind opponent along the raceline tangent.
     opponent_same_lane_width: 0.7        # Follow gap only applies when ego is roughly in same lane.
     opponent_pass_weight: 12.0           # In pass modes, pushes rollout to requested side near opponent.
-    opponent_pass_lateral_offset: 0.55   # Desired lateral offset from opponent during a pass.
+    opponent_pass_lateral_offset: 0.45   # Desired lateral offset from opponent during a pass.
     opponent_pass_longitudinal_window: 1.5 # Longitudinal window around opponent where pass-side cost applies.
     opponent_auto_wall_check_enabled: true
     opponent_auto_min_wall_clearance: 0.45 # Required wall clearance at candidate pass-side points.
