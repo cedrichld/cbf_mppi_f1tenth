@@ -7,6 +7,8 @@ opponent_lidar_detector:
     detector_marker_topic: /opponent/detection_markers
     detector_debug_topic: /opponent/detection_debug
 
+    scan_throttle_n: 4 # to chill the lidar
+
     # Relative paths are resolved from the mppi_bringup package share.
     waypoint_path: waypoints/houston_main1.csv
     waypoint_path_absolute: false
