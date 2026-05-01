@@ -211,6 +211,11 @@ private:
     range_weight_ = std::max(0.0, declareOrGetDouble("range_weight", 0.2));
     max_detection_speed_ = std::max(0.1, declareOrGetDouble("max_detection_speed", 12.0));
     detection_publish_rate_hz_ = std::max(1.0, declareOrGetDouble("detection_publish_rate_hz", 20.0));
+    // Process every Nth scan only. N=1 means every scan; N=2 halves the
+    // detector's CPU + memory-bandwidth footprint (effective ~7.5 Hz at a
+    // 15 Hz LiDAR), letting SICK driver keep up with its network buffer
+    // when sharing cores with us. Set higher if SICK PLL desyncs persist.
+    scan_throttle_n_ = std::max(1, static_cast<int>(declareOrGetInt("scan_throttle_n", 2)));
   }
 
   double declareOrGetDouble(const std::string & name, double default_value)
@@ -874,6 +879,15 @@ private:
 
   void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
   {
+    // Throttle: only process every scan_throttle_n_-th scan. Drops the
+    // detector's per-scan CPU + memory-bandwidth footprint proportionally,
+    // which lets SICK driver keep up on shared cores (otherwise SICK's
+    // PLL desyncs and we get bad scan timestamps). Default 2 = 7.5 Hz
+    // detection rate at a 15 Hz LiDAR — still plenty for tracking opp.
+    if (++scan_skip_counter_ % scan_throttle_n_ != 0) {
+      return;
+    }
+
     // refreshLiveParams() moved to onParamsTimer (2 Hz) — see ctor.
     const auto cb_t0 = std::chrono::steady_clock::now();
 
@@ -1007,6 +1021,8 @@ private:
   double range_weight_ = 0.2;
   double max_detection_speed_ = 12.0;
   double detection_publish_rate_hz_ = 20.0;
+  int scan_throttle_n_ = 1;
+  int scan_skip_counter_ = 0;
 
   bool have_ego_ = false;
   double ego_x_ = 0.0;
