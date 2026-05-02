@@ -12,7 +12,7 @@ lmppi_node:
     render: false                 # Race hardware: avoid extra rollout/sync unless debugging trajectories.
     
     # timer
-    control_loop_hz: 40.0
+    control_loop_hz: 30.0
 
     # Live tuning parameters: mppi_node.get_params() refreshes these on every
     # odometry callback, so they can be changed with ros2 param set.
