@@ -34,7 +34,7 @@ def generate_launch_description():
     )
 
     pkg_share = get_package_share_directory('mppi_bringup')
-    csv_path = os.path.join(pkg_share, 'waypoints', 'lev2fl', 'lev2_1.csv')
+    csv_path = os.path.join(pkg_share, 'waypoints', 'old', 'lev2fl', 'lev2_1.csv')
 
     mppi_node = Node(
         package='mppi_example',
@@ -53,10 +53,10 @@ def generate_launch_description():
             'params_file',
             default_value=PathJoinSubstitution([
                 FindPackageShare('mppi_bringup'),
-                'config',
-                'params_realev_overtake.yaml',
+                'config', 'old',
+                'params_lev.yaml',
             ]),
-            description='YAML with MPPI ROS2 params for actual car',
+            description='YAML with MPPI ROS2 params for lev (old/params_lev.yaml).',
         ),
         DeclareLaunchArgument(
             'drive_topic',
