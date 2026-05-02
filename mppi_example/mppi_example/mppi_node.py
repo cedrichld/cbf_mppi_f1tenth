@@ -12,6 +12,7 @@ from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
 from nav_msgs.msg import Odometry, Path as NavPath
+from sensor_msgs.msg import LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import Point
 from std_msgs.msg import Float32, Float32MultiArray, String
@@ -263,6 +264,19 @@ class MPPI_Node(Node):
             sensor_qos,
             callback_group=self._control_group,
         )
+        # In-process /scan safety check. Caches the latest scan; control_step
+        # uses it to find the min range in a forward cone and CAP /drive.speed
+        # accordingly. This is the lightweight "don't drive into a static
+        # obstacle that's not in the static map" backup when the opp pipeline
+        # isn't running. NOT a planner — just a safety brake.
+        self.latest_scan = None
+        self._scan_angles_cache = None
+        self._scan_angles_cache_step = 0.0
+        self._scan_angles_cache_min = 0.0
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback,
+            sensor_qos, callback_group=self._control_group,
+        )
         # publishers
         self.drive_pub = self.create_publisher(AckermannDriveStamped, "/drive", qos)
         self.reference_pub = self.create_publisher(Float32MultiArray, "/reference_arr", debug_qos)
@@ -481,7 +495,34 @@ class MPPI_Node(Node):
             'control_loop_hz': 25.0,
             'control_pose_stale_sec': 0.20,
             'stats_log_interval_sec': 5.0,
+            # /scan-based static-obstacle safety brake. Tuned for F1TENTH
+            # body geometry. Disable by setting scan_safety_enabled=false.
+            'scan_safety_enabled': True,
+            'scan_safety_cone_half_rad': 0.45,    # ±~26° from forward = the "what's directly in front of me" cone
+            'scan_safety_brake_dist': 0.6,        # below this clearance, command speed = scan_safety_min_speed
+            'scan_safety_warn_dist': 2.0,         # above this clearance, no cap. Linear ramp between brake and warn.
+            'scan_safety_min_speed': 0.5,         # m/s — speed when very close. Set 0 to fully stop.
+            'scan_safety_min_range': 0.10,        # ignore returns closer than this (laser noise / self-returns)
 
+            # In-process opponent detector. Race-day fallback when running
+            # the standalone opp launch caused SICK/PF contention on a
+            # shared core. When enabled, the closest forward cluster of
+            # /scan returns (filtered against the wall SDF when loaded) is
+            # written into the same opponent_xy_horizon buffer the network
+            # detector would have populated, so the existing opponent_cost
+            # machinery just works. Pair with opponent_cost_enabled=true
+            # and opponent_behavior_mode='clear' (radial repulsion only,
+            # no follow / pass state machine). Do NOT enable while the
+            # standalone opp launch is also publishing — they would
+            # race-write the same horizon buffer.
+            'inproc_opp_enabled': False,
+            'inproc_opp_max_range': 5.0,           # m — ignore returns farther than this
+            'inproc_opp_min_range': 0.30,          # m — ignore returns closer than this (self-returns / sensor edge)
+            'inproc_opp_cone_half_rad': 1.05,      # ~60° forward half-cone
+            'inproc_opp_min_cluster_pts': 4,       # minimum beams in a contiguous cluster to call it an obstacle
+            'inproc_opp_max_cluster_width': 1.20,  # m — drop clusters wider than this (likely a wall, not a car)
+            'inproc_opp_wall_skip_dist': 0.25,     # m — skip scan returns within this of a known wall (SDF)
+            'inproc_opp_min_run_interval_sec': 0.08,  # throttle: detect at most ~12 Hz regardless of scan rate
         }
         for key, value in defaults.items():
             if not hasattr(self.config, key):
@@ -789,6 +830,36 @@ class MPPI_Node(Node):
               fdesc('Skip MPPI solve if cached pose age exceeds this (sec).', 0.05, 1.0, 0.01))
         declf('stats_log_interval_sec', self.config.stats_log_interval_sec,
               fdesc('Periodic stats logger interval (sec). 0 disables.', 0.0, 60.0, 0.5))
+        declb('scan_safety_enabled', self.config.scan_safety_enabled,
+              desc('In-process /scan-based forward-cone speed cap (static-obstacle backstop).'))
+        declf('scan_safety_cone_half_rad', self.config.scan_safety_cone_half_rad,
+              fdesc('Forward cone half-angle for scan safety (rad).', 0.05, 1.5, 0.01))
+        declf('scan_safety_brake_dist', self.config.scan_safety_brake_dist,
+              fdesc('Below this forward clearance, cap speed at scan_safety_min_speed (m).', 0.05, 5.0, 0.05))
+        declf('scan_safety_warn_dist', self.config.scan_safety_warn_dist,
+              fdesc('Above this forward clearance, no cap. Linear ramp brake..warn (m).', 0.1, 10.0, 0.05))
+        declf('scan_safety_min_speed', self.config.scan_safety_min_speed,
+              fdesc('Speed cap when fully braked by scan safety (m/s). 0 = full stop.', 0.0, 5.0, 0.05))
+        declf('scan_safety_min_range', self.config.scan_safety_min_range,
+              fdesc('Ignore /scan returns closer than this (m).', 0.0, 1.0, 0.01))
+
+        declb('inproc_opp_enabled', self.config.inproc_opp_enabled,
+              desc('In-process opponent detector from /scan; writes opponent_xy_horizon directly.'))
+        declf('inproc_opp_max_range', self.config.inproc_opp_max_range,
+              fdesc('Max /scan range to consider for in-process opp detection (m).', 0.5, 12.0, 0.05))
+        declf('inproc_opp_min_range', self.config.inproc_opp_min_range,
+              fdesc('Min /scan range to consider for in-process opp detection (m).', 0.0, 2.0, 0.01))
+        declf('inproc_opp_cone_half_rad', self.config.inproc_opp_cone_half_rad,
+              fdesc('Forward half-cone for in-process opp detection (rad).', 0.05, 1.57, 0.01))
+        decli('inproc_opp_min_cluster_pts', self.config.inproc_opp_min_cluster_pts,
+              idesc('Min consecutive beams in a candidate opp cluster.', 1, 64))
+        declf('inproc_opp_max_cluster_width', self.config.inproc_opp_max_cluster_width,
+              fdesc('Reject candidate clusters wider than this (m, bbox diag).', 0.1, 5.0, 0.05))
+        declf('inproc_opp_wall_skip_dist', self.config.inproc_opp_wall_skip_dist,
+              fdesc('Skip /scan returns within this distance of a known wall (m). 0 disables SDF filter.',
+                    0.0, 2.0, 0.01))
+        declf('inproc_opp_min_run_interval_sec', self.config.inproc_opp_min_run_interval_sec,
+              fdesc('Throttle for in-process opp detection (sec between runs).', 0.0, 1.0, 0.01))
 
     def get_params(self, startup=False):
         if startup:
@@ -1108,6 +1179,46 @@ class MPPI_Node(Node):
         self.config.stats_log_interval_sec = max(
             0.0, float(self.get_parameter('stats_log_interval_sec').value),
         )
+        self.config.scan_safety_enabled = bool(self.get_parameter('scan_safety_enabled').value)
+        self.config.scan_safety_cone_half_rad = max(
+            0.0, float(self.get_parameter('scan_safety_cone_half_rad').value),
+        )
+        self.config.scan_safety_brake_dist = max(
+            0.0, float(self.get_parameter('scan_safety_brake_dist').value),
+        )
+        self.config.scan_safety_warn_dist = max(
+            self.config.scan_safety_brake_dist + 1e-3,
+            float(self.get_parameter('scan_safety_warn_dist').value),
+        )
+        self.config.scan_safety_min_speed = max(
+            0.0, float(self.get_parameter('scan_safety_min_speed').value),
+        )
+        self.config.scan_safety_min_range = max(
+            0.0, float(self.get_parameter('scan_safety_min_range').value),
+        )
+
+        self.config.inproc_opp_enabled = bool(self.get_parameter('inproc_opp_enabled').value)
+        self.config.inproc_opp_max_range = max(
+            0.0, float(self.get_parameter('inproc_opp_max_range').value),
+        )
+        self.config.inproc_opp_min_range = max(
+            0.0, float(self.get_parameter('inproc_opp_min_range').value),
+        )
+        self.config.inproc_opp_cone_half_rad = max(
+            0.0, float(self.get_parameter('inproc_opp_cone_half_rad').value),
+        )
+        self.config.inproc_opp_min_cluster_pts = max(
+            1, int(self.get_parameter('inproc_opp_min_cluster_pts').value),
+        )
+        self.config.inproc_opp_max_cluster_width = max(
+            0.0, float(self.get_parameter('inproc_opp_max_cluster_width').value),
+        )
+        self.config.inproc_opp_wall_skip_dist = max(
+            0.0, float(self.get_parameter('inproc_opp_wall_skip_dist').value),
+        )
+        self.config.inproc_opp_min_run_interval_sec = max(
+            0.0, float(self.get_parameter('inproc_opp_min_run_interval_sec').value),
+        )
 
         if hasattr(self, 'infer_env'):
             self.infer_env.config = self.config
@@ -1149,6 +1260,212 @@ class MPPI_Node(Node):
 
     def now_sec(self):
         return float(self.get_clock().now().nanoseconds) * 1e-9
+
+    def scan_callback(self, msg):
+        """Cache the latest LaserScan for the in-process safety brake.
+
+        Tiny callback (just stores the msg ref) — analysis is done lazily
+        in control_step so that scan-rate changes don't add per-scan
+        compute work to MPPI's executor.
+        """
+        self.latest_scan = msg
+        # One-time: pre-warm sample_wall_distance with the FULL-scan shape
+        # used by _inproc_opp_detect_step so the first detection doesn't
+        # eat a JAX compile spike during driving (~75-150 ms), independent
+        # of whether inproc_opp_enabled is set at startup. The startup
+        # stop_drive window absorbs the cost. The (n_probes, 2) pre-warm
+        # in __init__ only covers opponent_pass_clearance.
+        if not getattr(self, '_inproc_opp_sdf_warmed', False):
+            self._inproc_opp_sdf_warmed = True
+            try:
+                if getattr(self.infer_env, 'wall_sdf', None) is not None:
+                    n = len(msg.ranges)
+                    if n > 0:
+                        self.infer_env.sample_wall_distance(
+                            jnp.zeros((n, 2), dtype=jnp.float32))
+            except Exception as exc:  # noqa: BLE001 — pre-warm best-effort
+                self.get_logger().warn(
+                    f"inproc_opp full-scan SDF pre-warm skipped: {exc}")
+        # Cheap (≤2 ms), throttled to ~12 Hz, gated by inproc_opp_enabled.
+        if self.config.inproc_opp_enabled:
+            self._inproc_opp_detect_step()
+
+    def _scan_safety_speed_cap(self):
+        """Look at the latest cached /scan and return a speed cap (m/s),
+        or None if no cap should be applied.
+
+        Cone: forward arc of half-width `scan_safety_cone_half_rad` around
+        angle 0 (LiDAR forward). Find min range in that cone, then linearly
+        ramp the cap between brake_dist (cap=min_speed) and warn_dist (no cap).
+        """
+        if not self.config.scan_safety_enabled:
+            return None
+        scan = self.latest_scan
+        if scan is None:
+            return None
+        ranges = np.asarray(scan.ranges, dtype=np.float32)
+        if ranges.size == 0:
+            return None
+        n = ranges.size
+        # Build angles only once per scan size (cached on the node).
+        if (getattr(self, '_scan_angles_cache', None) is None
+                or self._scan_angles_cache.size != n
+                or self._scan_angles_cache_step != scan.angle_increment
+                or self._scan_angles_cache_min != scan.angle_min):
+            self._scan_angles_cache = (
+                scan.angle_min + np.arange(n, dtype=np.float32) * scan.angle_increment
+            )
+            self._scan_angles_cache_step = scan.angle_increment
+            self._scan_angles_cache_min = scan.angle_min
+        angles = self._scan_angles_cache
+        # Forward cone: |angle| <= cone_half. Body-frame x-forward.
+        cone_mask = np.abs(angles) <= self.config.scan_safety_cone_half_rad
+        finite_mask = np.isfinite(ranges) & (ranges > self.config.scan_safety_min_range)
+        valid = cone_mask & finite_mask
+        if not np.any(valid):
+            return None
+        forward_clearance = float(ranges[valid].min())
+        brake = float(self.config.scan_safety_brake_dist)
+        warn = float(self.config.scan_safety_warn_dist)
+        if forward_clearance >= warn:
+            return None
+        if forward_clearance <= brake:
+            return float(self.config.scan_safety_min_speed)
+        # Linear ramp brake (=min_speed) ... warn (=no cap signal). We need
+        # to know the speed AT warn — set it to the configured max_speed so
+        # the ramp is well-defined. Practically the ramp interpolates
+        # between min_speed and max_speed.
+        ramp = (forward_clearance - brake) / max(1e-6, warn - brake)
+        max_speed = float(self.config.max_speed)
+        cap = self.config.scan_safety_min_speed + ramp * (max_speed - self.config.scan_safety_min_speed)
+        return float(cap)
+
+    def _inproc_opp_detect_step(self):
+        """Find the closest forward dynamic-ish cluster in the latest /scan
+        and write it into opponent_xy_horizon as a static N-step horizon.
+
+        Pipeline (all numpy except the SDF lookup):
+          1. Build per-beam (range, angle) from cached scan; reuse the
+             angle cache populated by _scan_safety_speed_cap.
+          2. Forward-cone + range filter.
+          3. Convert valid points to map frame using the latest cached pose.
+          4. (Optional) drop returns within wall_skip_dist of a known wall
+             via infer_env.sample_wall_distance — the only JAX call. Always
+             called on the FULL fixed-shape scan to keep the JAX trace cache
+             hot (variable shapes would force recompiles per call, which is
+             what bit `opponent_pass_clearance` historically — see its
+             docstring).
+          5. Cluster surviving beams by consecutive scan-index runs (single-
+             beam gaps tolerated).
+          6. Pick the cluster with the closest centroid to ego that fits the
+             min-points / max-width gates.
+          7. Write N copies of its centroid into opponent_xy_horizon and
+             stamp opponent_path_time so get_opponent_horizon() picks it up
+             with no other code changes.
+        """
+        scan = self.latest_scan
+        pose_msg = self.latest_pose_msg
+        if scan is None or pose_msg is None:
+            return
+
+        now = self.now_sec()
+        last = getattr(self, '_inproc_opp_last_run', 0.0)
+        if now - last < self.config.inproc_opp_min_run_interval_sec:
+            return
+        self._inproc_opp_last_run = now
+
+        ranges = np.asarray(scan.ranges, dtype=np.float32)
+        if ranges.size == 0:
+            return
+        n = ranges.size
+
+        # Reuse / populate angle cache (shared with _scan_safety_speed_cap).
+        if (getattr(self, '_scan_angles_cache', None) is None
+                or self._scan_angles_cache.size != n
+                or self._scan_angles_cache_step != scan.angle_increment
+                or self._scan_angles_cache_min != scan.angle_min):
+            self._scan_angles_cache = (
+                scan.angle_min + np.arange(n, dtype=np.float32) * scan.angle_increment
+            )
+            self._scan_angles_cache_step = scan.angle_increment
+            self._scan_angles_cache_min = scan.angle_min
+        angles = self._scan_angles_cache
+
+        half = float(self.config.inproc_opp_cone_half_rad)
+        rmin = float(self.config.inproc_opp_min_range)
+        rmax = float(self.config.inproc_opp_max_range)
+        finite = np.isfinite(ranges)
+        valid = finite & (np.abs(angles) <= half) & (ranges >= rmin) & (ranges <= rmax)
+        if not np.any(valid):
+            return
+
+        # Ego pose in map frame (latest cached pose; may be slightly stale —
+        # acceptable, the ego moves at <12 m/s and detection runs at ~12 Hz).
+        pose = pose_msg.pose.pose
+        ego_x = float(pose.position.x)
+        ego_y = float(pose.position.y)
+        ego_yaw = float(self.quaternion_to_yaw(pose.orientation))
+
+        # Convert ALL beams to map frame so the SDF batch shape is constant
+        # (n,). Bad beams (inf/nan range) produce NaN coords; we mask them
+        # out post-SDF using `valid`.
+        safe_r = np.where(finite, ranges, 0.0)
+        map_a = ego_yaw + angles
+        all_x = ego_x + safe_r * np.cos(map_a)
+        all_y = ego_y + safe_r * np.sin(map_a)
+        all_pts = np.stack([all_x, all_y], axis=-1)
+
+        wall_skip = float(self.config.inproc_opp_wall_skip_dist)
+        if (wall_skip > 0.0
+                and getattr(self, 'infer_env', None) is not None
+                and getattr(self.infer_env, 'wall_sdf', None) is not None):
+            try:
+                wall_d = np.asarray(
+                    self.infer_env.sample_wall_distance(jnp.asarray(all_pts)),
+                    dtype=np.float32,
+                )
+                valid = valid & (wall_d >= wall_skip)
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"inproc_opp: wall SDF lookup failed ({exc}); skipping wall filter")
+
+        if not np.any(valid):
+            return
+
+        # Cluster surviving beams by consecutive scan-index runs.
+        valid_idx = np.where(valid)[0]
+        min_pts = int(self.config.inproc_opp_min_cluster_pts)
+        if valid_idx.size < min_pts:
+            return
+        breaks = np.where(np.diff(valid_idx) > 2)[0]  # tolerate single-beam gaps
+        starts = np.concatenate(([0], breaks + 1))
+        ends = np.concatenate((breaks + 1, [valid_idx.size]))
+
+        max_width = float(self.config.inproc_opp_max_cluster_width)
+        best_dist = np.inf
+        best_centroid = None
+        for s, e in zip(starts, ends):
+            if e - s < min_pts:
+                continue
+            beam_idx = valid_idx[s:e]
+            cluster = all_pts[beam_idx]
+            bbox = cluster.max(0) - cluster.min(0)
+            if float(np.hypot(bbox[0], bbox[1])) > max_width:
+                continue
+            centroid = cluster.mean(axis=0)
+            d = float(np.hypot(centroid[0] - ego_x, centroid[1] - ego_y))
+            if d < best_dist:
+                best_dist = d
+                best_centroid = centroid
+        if best_centroid is None:
+            return
+
+        n_steps = int(self.config.n_steps)
+        self.opponent_xy_horizon = np.tile(
+            best_centroid.astype(np.float32),
+            (n_steps, 1),
+        )
+        self.opponent_path_time = now
 
     def opponent_path_callback(self, msg):
         self._stats_opponent_rx += 1
@@ -2021,6 +2338,13 @@ class MPPI_Node(Node):
                 self.config.max_speed,
             )
             self.control[1] = float(max(self.control[1], startup_speed))
+
+        # In-process /scan-based static-obstacle safety brake. APPLIED LAST
+        # so it overrides startup_speed when there's an obstacle in front —
+        # we'd rather coast below startup_speed than ram the obstacle.
+        scan_cap = self._scan_safety_speed_cap()
+        if scan_cap is not None:
+            self.control[1] = min(self.control[1], scan_cap)
 
         if np.isnan(self.control).any() or np.isinf(self.control).any():
             self.control = np.array([0.0, 0.0])
