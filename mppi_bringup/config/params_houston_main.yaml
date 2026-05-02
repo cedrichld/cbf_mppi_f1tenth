@@ -16,13 +16,13 @@ lmppi_node:
 
     # Live tuning parameters: mppi_node.get_params() refreshes these on every
     # odometry callback, so they can be changed with ros2 param set.
-    temperature: 0.02             # MPPI greediness. Lower = winner-take-all; higher = smoother averaging.
+    temperature: 0.04             # MPPI greediness. Lower = winner-take-all; higher = smoother averaging.
     # damping: 0.001                # Prevents weight normalization issues when rollout rewards are similar.
     # ref_vel: 2.0                  # OLD: Legacy constant-speed reference seed. Mostly bypassed when profile is on.
     init_vel: 2.1                 # Minimum speed assumed by the rollout model at startup/very low speed.
     startup_speed: 1.0            # Minimum /drive.speed while measured speed is below init_vel.
     use_pose_delta_state_estimate: true # Real car: estimate vx / yaw-rate from PF pose deltas plus command prior.
-    friction: 0.5                # Model-only tire/friction belief for dynamic_ST rollouts; tune empirically.
+    friction: 0.4                # Model-only tire/friction belief for dynamic_ST rollouts; tune empirically.
     # n_iterations: 1               # MPPI update passes per odom callback. More can improve solve quality but costs time.
 
     # Use the MPPI raceline CSV vx_mps column for turn-aware reference spacing.
@@ -120,6 +120,33 @@ lmppi_node:
     state_est_wz_prior: 0.4
     state_est_hiccup_dt: 0.06
     state_est_hiccup_prior_scale: 0.35
+
+    # /scan-based forward-cone speed cap. Reactive backstop for static
+    # obstacles (independent of any opp detection). Race default OFF —
+    # appeared to add tick latency in the last test (might also have been
+    # the low battery / lidar PLL drift). Flip to true via
+    # `ros2 param set` if you want it active without restarting.
+    scan_safety_enabled: false
+    scan_safety_cone_half_rad: 0.45    # ±~26° forward cone
+    scan_safety_brake_dist: 0.6        # below this clearance, cap = scan_safety_min_speed
+    scan_safety_warn_dist: 2.0         # above this clearance, no cap
+    scan_safety_min_speed: 0.5         # m/s when fully braked. 0 = full stop.
+    scan_safety_min_range: 0.10        # ignore returns closer than this
+
+    # In-process opponent detector (writes opponent_xy_horizon directly,
+    # bypasses the standalone opp launch). Race default OFF — opponent
+    # cost machinery below stays armed but is fed nothing, so it does
+    # nothing unless inproc is flipped on or the network detector
+    # publishes. Do NOT enable both inproc and the standalone opp launch
+    # at the same time (last-writer-wins on opponent_xy_horizon).
+    inproc_opp_enabled: false
+    inproc_opp_max_range: 5.0          # m
+    inproc_opp_min_range: 0.30         # m
+    inproc_opp_cone_half_rad: 1.05     # ~60° forward half-cone
+    inproc_opp_min_cluster_pts: 4      # min consecutive beams to call it an obstacle
+    inproc_opp_max_cluster_width: 1.20 # m, drops walls
+    inproc_opp_wall_skip_dist: 0.25    # m, SDF filter; 0 disables
+    inproc_opp_min_run_interval_sec: 0.08  # ~12 Hz throttle
 
 
     ######################################################
