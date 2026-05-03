@@ -659,10 +659,10 @@ class MPPI_Node(Node):
         # ---- Control sampling ----
         declf('control_sample_std_steer', self.config.control_sample_std[0],
               fdesc('Std of normalized steering-rate noise. Higher = sharper exploration.',
-                    0.0, 2.0, 0.01))
+                    0.0, 4.0, 0.01))
         declf('control_sample_std_accel', self.config.control_sample_std[1],
               fdesc('Std of normalized accel noise. Higher = harder accel/brake exploration.',
-                    0.0, 5.0, 0.05))
+                    0.0, 20.0, 0.05))
         declf('steer_vel_scale', steer_vel_scale,
               fdesc('Converts normalized steering action to rad/s.',
                     0.1, 10.0, 0.05))
