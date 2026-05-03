@@ -16,6 +16,25 @@ lmppi_node:
     # timer
     control_loop_hz: 30.0
 
+    # Control trigger architecture (NEW). 'odom_gate': pose_callback rate-
+    # gates and dispatches control_step (~30 Hz from a 50 Hz pose source),
+    # so the SingleThreadedExecutor cannot starve pose ingestion behind a
+    # continuously-ready timer. control_loop_timer becomes a low-rate
+    # watchdog that only fires if pose-driven dispatch hasn't run in
+    # control_watchdog_max_silence_sec. 'timer' is the legacy fixed-rate
+    # behavior (one-flag rollback). control_trigger_mode is read-only at
+    # startup; restart node to switch.
+    control_trigger_mode: odom_gate              # 'odom_gate' | 'timer'
+    control_watchdog_hz: 5.0                     # watchdog timer rate in odom_gate mode
+    control_watchdog_max_silence_sec: 0.10       # fire watchdog if pose-driven hasn't run in this long
+
+    # Live param refresh gate. OFF for race day so the 2 Hz refresh timer
+    # only reads a single bool per tick (essentially free) instead of
+    # ~100 params. Flip true via `ros2 param set lmppi_node live_tuning_enabled true`
+    # for tuning sessions; flip back to false before racing.
+    live_tuning_enabled: false
+
+
     # Live tuning parameters
     temperature: 0.01
     init_vel: 2.1

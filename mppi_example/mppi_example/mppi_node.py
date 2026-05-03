@@ -170,6 +170,18 @@ class MPPI_Node(Node):
         self.latest_pose_msg = None
         self.latest_pose_recv_time = None
         self.last_control_step_wall_time = None
+        # Odom-gate trigger state. _next_control_fire_time uses the
+        # next-fire-time amortization scheme so that with PF at 50 Hz and
+        # control_loop_hz=30, we get ~30 Hz effective on average (mix of
+        # 20 ms / 40 ms gaps that average to 33 ms) instead of always
+        # quantizing to 25 Hz. Floor against `now + period/2` prevents
+        # catchup-cascade if we ever fall far behind.
+        self._next_control_fire_time = 0.0
+        self._last_control_step_start_time = 0.0
+        self._last_ego_relay_pub_time = 0.0
+        self._last_get_params_dt = 0.0
+        self._stats_control_trigger_odom = 0
+        self._stats_control_trigger_watchdog = 0
         # Visualization-only rollout. Populated when use_pose_delta_state_estimate
         # is true so the marker shows a clean (raw-twist-rolled) trajectory
         # while the controller still solved against the IIR-estimated state.
@@ -299,15 +311,28 @@ class MPPI_Node(Node):
         )
         self.get_logger().info('Raceline update service ready at /mppi/update_raceline')
 
-        # Fixed-rate control loop. Period derived from control_loop_hz at
-        # startup (read_only param so we do not need to re-create the timer).
-        control_period = 1.0 / max(1.0, float(self.config.control_loop_hz))
+        # Control loop timer. Behavior depends on control_trigger_mode:
+        #   - 'odom_gate' (default): timer is a low-rate WATCHDOG only.
+        #     pose_callback rate-gates and dispatches control_step itself,
+        #     which is the actual ~30 Hz control source. Watchdog only
+        #     fires if pose-driven dispatch hasn't run in
+        #     control_watchdog_max_silence_sec (PF degradation).
+        #   - 'timer' (legacy fallback): timer at control_loop_hz drives
+        #     control_step on every fire, as in the pre-fix code.
+        if self.config.control_trigger_mode == 'odom_gate':
+            timer_hz = self.config.control_watchdog_hz
+            timer_role = 'watchdog'
+        else:
+            timer_hz = self.config.control_loop_hz
+            timer_role = 'fixed-rate driver'
+        control_period = 1.0 / max(0.5, float(timer_hz))
         self.control_loop_timer = self.create_timer(
             control_period, self.control_timer, callback_group=self._control_group,
         )
         self.get_logger().info(
-            f'Control loop timer at {self.config.control_loop_hz:.1f} Hz '
-            f'(period {control_period*1000:.1f} ms)'
+            f'Control trigger mode: {self.config.control_trigger_mode}; '
+            f'timer at {timer_hz:.1f} Hz ({timer_role}, period {control_period*1000:.1f} ms); '
+            f'pose-driven target rate {self.config.control_loop_hz:.1f} Hz'
         )
 
         # Periodic stats logger. Default group so it never competes with the
@@ -317,24 +342,23 @@ class MPPI_Node(Node):
                 self.config.stats_log_interval_sec, self.stats_timer,
             )
 
-        # Refresh live params at 2 Hz instead of inside control_step. The
-        # rclpy parameter service is mutex-protected pure-Python; reading
-        # ~50 params at 40 Hz held the GIL ~20%+ of wall time, head-of-line
-        # blocking pose_callback under the MultiThreadedExecutor. Default
-        # callback group keeps it off the control hot path.
-        self.params_refresh_timer = self.create_timer(0.5, self.get_params)
+        # Live-param refresh timer at 2 Hz. GATED on live_tuning_enabled:
+        # when off (race default), this timer reads ONE bool per tick and
+        # returns — essentially free. When set true via `ros2 param set
+        # live_tuning_enabled true`, the next 2 Hz tick starts running the
+        # full ~100-param refresh. Removes get_params() as a head-of-line
+        # block source while preserving live tunability for debug sessions.
+        self.params_refresh_timer = self.create_timer(0.5, self._maybe_refresh_params)
 
-        # Low-rate ego-pose RELAY for the opponent detector. The detector
-        # used to subscribe to /pf/pose/odom directly, which forced PF's
-        # publisher to do +1 subscriber's work per publish — observed to
-        # drop MPPI-side pose_rx from 50 Hz to ~5 Hz when opp launched.
-        # Republishing the cached pose at 10 Hz from MPPI (which is already
-        # the authoritative subscriber) means the detector subscribes to
-        # MPPI's relay instead of PF, removing the load on PF.
+        # Ego-pose RELAY for the opponent detector. The detector used to
+        # subscribe to /pf/pose/odom directly, which forced PF's publisher
+        # to do +1 subscriber's work per publish (observed to drop pose_rx
+        # 50 Hz → ~5 Hz under opp launch). Now published from inside
+        # pose_callback (rate-limited to 10 Hz) so we have one fewer timer
+        # competing for executor slots in odom_gate mode.
         self.ego_relay_pub = self.create_publisher(
             Odometry, "/mppi/ego_odom_for_opp", sensor_qos,
         )
-        self.ego_relay_timer = self.create_timer(0.1, self._publish_ego_relay)
 
         # Stop Python gen-2 garbage collection from firing during a race.
         # JAX's compile cache + traced objects make the gen-2 sweep walk a
@@ -495,6 +519,23 @@ class MPPI_Node(Node):
             'control_loop_hz': 25.0,
             'control_pose_stale_sec': 0.20,
             'stats_log_interval_sec': 5.0,
+            # Trigger source for control_step. Race default 'odom_gate':
+            # pose_callback rate-gates and dispatches control_step itself,
+            # so under SingleThreadedExecutor the timer can never starve
+            # pose ingestion. The control_loop_timer becomes a low-rate
+            # watchdog that only fires if pose_callback hasn't dispatched
+            # in a while (PF degradation). 'timer' is the legacy fixed-
+            # rate behavior; one-flag rollback if odom_gate misbehaves.
+            'control_trigger_mode': 'odom_gate',  # 'odom_gate' | 'timer'
+            'control_watchdog_hz': 5.0,           # watchdog rate when in odom_gate
+            'control_watchdog_max_silence_sec': 0.10,  # fire watchdog if pose-driven hasn't run in this long
+            # Live-param refresh gate. Default OFF on race day: the 2 Hz
+            # timer is still attached but only reads ONE bool per tick when
+            # off (essentially free). When set true via `ros2 param set`,
+            # next 2 Hz tick starts running the full ~100-param refresh.
+            # Removes get_params() as a head-of-line block source codex
+            # flagged. Keep off in races, flip on for tuning sessions.
+            'live_tuning_enabled': False,
             # /scan-based static-obstacle safety brake. Tuned for F1TENTH
             # body geometry. Disable by setting scan_safety_enabled=false.
             'scan_safety_enabled': True,
@@ -826,6 +867,18 @@ class MPPI_Node(Node):
         # build the timer; pose-stale and stats-interval are live-tunable.
         declf('control_loop_hz', self.config.control_loop_hz,
               fdesc('[startup] Fixed-rate control loop frequency (Hz).', 1.0, 100.0, 1.0, read_only=True))
+        decls('control_trigger_mode', self.config.control_trigger_mode,
+              desc('[startup] Control trigger source: "odom_gate" (pose drives, timer is watchdog) '
+                   'or "timer" (legacy fixed-rate). Restart node to switch.', read_only=True))
+        declf('control_watchdog_hz', self.config.control_watchdog_hz,
+              fdesc('[startup] Watchdog timer rate when in odom_gate mode (Hz).',
+                    0.5, 30.0, 0.5, read_only=True))
+        declf('control_watchdog_max_silence_sec', self.config.control_watchdog_max_silence_sec,
+              fdesc('In odom_gate mode, watchdog fires only if pose-driven control hasn\'t run in this long.',
+                    0.02, 1.0, 0.01))
+        declb('live_tuning_enabled', self.config.live_tuning_enabled,
+              desc('Enable live parameter refresh (~100 reads at 2 Hz). Off by default to avoid '
+                   'head-of-line blocking. Flip on via `ros2 param set` for tuning sessions.'))
         declf('control_pose_stale_sec', self.config.control_pose_stale_sec,
               fdesc('Skip MPPI solve if cached pose age exceeds this (sec).', 0.05, 1.0, 0.01))
         declf('stats_log_interval_sec', self.config.stats_log_interval_sec,
@@ -1173,6 +1226,21 @@ class MPPI_Node(Node):
             self.config.control_loop_hz = float(np.clip(
                 float(self.get_parameter('control_loop_hz').value), 1.0, 100.0,
             ))
+            self.config.control_trigger_mode = str(
+                self.get_parameter('control_trigger_mode').value
+            ).strip().lower()
+            if self.config.control_trigger_mode not in ('odom_gate', 'timer'):
+                self.get_logger().warn(
+                    f"Unknown control_trigger_mode='{self.config.control_trigger_mode}', "
+                    f"falling back to 'odom_gate'"
+                )
+                self.config.control_trigger_mode = 'odom_gate'
+            self.config.control_watchdog_hz = float(np.clip(
+                float(self.get_parameter('control_watchdog_hz').value), 0.5, 30.0,
+            ))
+        self.config.control_watchdog_max_silence_sec = max(
+            0.02, float(self.get_parameter('control_watchdog_max_silence_sec').value),
+        )
         self.config.control_pose_stale_sec = max(
             0.0, float(self.get_parameter('control_pose_stale_sec').value),
         )
@@ -2096,37 +2164,72 @@ class MPPI_Node(Node):
         self.opponent_auto_mode_name_pub.publish(name_msg)
 
     def pose_callback(self, pose_msg):
-        """
-        Lightweight: cache latest odom + recv time. The control loop runs on
-        a fixed-rate timer, not on this callback. Keeping this minimal lets
-        the cache update during an in-progress MPPI solve under a
-        MultiThreadedExecutor — so PF cadence variation does not throttle
-        the controller.
+        """Cache pose + (in odom_gate mode) drive control_step.
+
+        In odom_gate mode (race default), this callback IS the control
+        trigger. We rate-gate to control_loop_hz using a "next fire time"
+        amortization that achieves ~30 Hz on average given a 50 Hz pose
+        source, then dispatch control_step inline. Because pose ingestion
+        is the trigger, the SingleThreadedExecutor cannot starve it
+        behind a continuously-ready timer — that was the bug.
+
+        In timer mode (legacy fallback), this stays minimal: just cache.
         """
         self.latest_pose_msg = pose_msg
-        self.latest_pose_recv_time = time.time()
+        now = time.time()
+        self.latest_pose_recv_time = now
         self._stats_pose_rx += 1
 
-    def _publish_ego_relay(self):
-        """Republish the cached ego odom at the relay timer rate (10 Hz).
+        # Inline ego-relay (replaces the dropped 10 Hz timer): publish at
+        # 10 Hz max, only when at least one subscriber exists.
+        if (self.ego_relay_pub.get_subscription_count() > 0
+                and now - self._last_ego_relay_pub_time >= 0.1):
+            self._last_ego_relay_pub_time = now
+            self.ego_relay_pub.publish(pose_msg)
 
-        The opponent detector subscribes here instead of /pf/pose/odom so
-        PF's publisher doesn't pay the cost of an extra 50 Hz subscriber.
-        Skip publish if no subscriber is listening (saves serialization).
-        """
-        if self.latest_pose_msg is None:
+        if self.config.control_trigger_mode != 'odom_gate':
             return
-        if self.ego_relay_pub.get_subscription_count() == 0:
+
+        # Rate-gate dispatch: amortized 30 Hz from a 50 Hz pose source.
+        if now < self._next_control_fire_time:
             return
-        self.ego_relay_pub.publish(self.latest_pose_msg)
+
+        # Pose-stale guard before firing.
+        recv_age = 0.0  # we're the trigger, recv is "now"
+        self._stats_pose_age = recv_age
+
+        period = 1.0 / max(1.0, float(self.config.control_loop_hz))
+        # Floor against `now + period/2` so a long stall doesn't trigger
+        # a catchup-cascade on every subsequent pose.
+        self._next_control_fire_time = max(
+            now + period * 0.5,
+            self._next_control_fire_time + period,
+        )
+        self._last_control_step_start_time = now
+        self._stats_control_trigger_odom += 1
+        self.control_step(pose_msg)
+
+    def _maybe_refresh_params(self):
+        """2 Hz timer callback. Single bool read when live tuning is OFF
+        (essentially free); full ~100-param refresh when ON."""
+        try:
+            live = bool(self.get_parameter('live_tuning_enabled').value)
+        except Exception:
+            live = False
+        if not live:
+            return
+        t0 = time.time()
+        self.get_params()
+        self._last_get_params_dt = time.time() - t0
 
     def control_timer(self):
-        """Fixed-rate driver of the MPPI solve.
+        """Mode-dependent control timer.
 
-        Reads the cached pose, checks staleness, and either calls
-        control_step or skips. Skipping is silent in /drive (no republish);
-        downstream sees the last command persist until a fresh pose lets us
-        compute a new one.
+        odom_gate: WATCHDOG. Only fires control_step if pose-driven
+        dispatch hasn't run in control_watchdog_max_silence_sec
+        (i.e., PF degraded). Normally a no-op.
+
+        timer: legacy fixed-rate driver — every fire dispatches.
         """
         self._stats_control_ticks += 1
         pose_msg = self.latest_pose_msg
@@ -2134,18 +2237,21 @@ class MPPI_Node(Node):
             self._stats_control_skips_no_pose += 1
             return
         now = time.time()
-        msg_stamp = self.stamp_to_sec(pose_msg.header.stamp)
-        if msg_stamp <= 0.0 or not np.isfinite(msg_stamp):
-            # Fall back to recv time if upstream stamps are bad.
-            msg_stamp = self.latest_pose_recv_time or now
-        # Pose age uses recv time + (now - recv) as an upper bound on
-        # in-pipeline staleness; this is independent of clock drift between
-        # PF and the controller.
+
+        if self.config.control_trigger_mode == 'odom_gate':
+            since_last = now - self._last_control_step_start_time
+            if since_last < self.config.control_watchdog_max_silence_sec:
+                return
+            self._stats_control_trigger_watchdog += 1
+
+        # Stale check (both modes).
         recv_age = now - (self.latest_pose_recv_time or now)
         self._stats_pose_age = recv_age
         if recv_age > self.config.control_pose_stale_sec:
             self._stats_control_skips_stale += 1
             return
+
+        self._last_control_step_start_time = now
         self.control_step(pose_msg)
 
     def control_step(self, pose_msg):
@@ -2445,18 +2551,25 @@ class MPPI_Node(Node):
             solve_max = float(arr.max())
         else:
             solve_mean = solve_p99 = solve_max = 0.0
+        trigger_total = max(1, self._stats_control_trigger_odom + self._stats_control_trigger_watchdog)
+        odom_pct = 100.0 * self._stats_control_trigger_odom / trigger_total
         self.get_logger().info(
             "MPPI {:5.1f}Hz | pose_rx {:5.1f}Hz | drive_tx {:5.1f}Hz | "
             "ctrl_ticks {:5.1f}Hz (skip stale={} no_pose={}) | "
+            "trigger odom={} wdog={} ({:.0f}% odom) | "
             "solve mean={:5.1f}ms p99={:5.1f}ms max={:5.1f}ms | "
             "phase_total_max={:5.1f}ms (debug={:.1f} viz={:.1f}) | "
-            "pose_age={:5.1f}ms | guard+={} (soft+={}) | opp_rx {:4.1f}Hz".format(
+            "pose_age={:5.1f}ms | guard+={} (soft+={}) | "
+            "get_params_dt={:.1f}ms | opp_rx {:4.1f}Hz".format(
                 self._stats_drive_tx / window,
                 self._stats_pose_rx / window,
                 self._stats_drive_tx / window,
                 self._stats_control_ticks / window,
                 self._stats_control_skips_stale,
                 self._stats_control_skips_no_pose,
+                self._stats_control_trigger_odom,
+                self._stats_control_trigger_watchdog,
+                odom_pct,
                 solve_mean * 1000.0,
                 solve_p99 * 1000.0,
                 solve_max * 1000.0,
@@ -2466,6 +2579,7 @@ class MPPI_Node(Node):
                 self._stats_pose_age * 1000.0,
                 guard_delta,
                 soft_guard_delta,
+                self._last_get_params_dt * 1000.0,
                 self._stats_opponent_rx / window,
             )
         )
@@ -2476,6 +2590,8 @@ class MPPI_Node(Node):
         self._stats_control_ticks = 0
         self._stats_control_skips_stale = 0
         self._stats_control_skips_no_pose = 0
+        self._stats_control_trigger_odom = 0
+        self._stats_control_trigger_watchdog = 0
         self._stats_solve_times = []
         self._stats_phase_total_max_window = 0.0
         self._stats_phase_debug_max_window = 0.0

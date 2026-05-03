@@ -18,7 +18,14 @@ except ImportError:
     from dynamics_models.dynamics_models_jax import vehicle_dynamics_ks, vehicle_dynamics_st
 
 CUDANUM = 0
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+# Preallocate a fixed slice of unified memory so the JAX allocator doesn't
+# fragment over a long race. PREALLOCATE=true + MEM_FRACTION=0.50 reserves
+# ~3.8 GB of the 7.6 GB Orin Nano shared CPU/GPU pool for JAX, leaving
+# the rest for PF + SICK + system. Race-day mitigation for the silent
+# Jetson hang we saw mid-race-1 (likely OOM/fragmentation/brownout — this
+# fixes the OOM/fragmentation surface).
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.50"
 os.environ["CUDA_VISIBLE_DEVICES"] = str(CUDANUM)
 
 class InferEnv():
